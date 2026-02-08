@@ -505,3 +505,26 @@ FodyWeavers.xsd
 src/raytrace/nvcc_optix_stdout.txt
 src/raytrace/nvcc_stderr.txt
 src/raytrace/nvcc_stdout.txt
+
+# VRAD-RTX test automation and unit test files
+!/game/bin/
+/game/bin/*
+!/game/bin/x64/
+/game/bin/x64/*
+!/game/bin/x64/test_vrad_optix.bat
+!/game/bin/x64/test_vrad_optix_quick.bat
+!/game/bin/x64/test_vrad_optix.ps1
+!/game/bin/x64/test_vrad_optix_quick.ps1
+!/game/bin/x64/bsp_diff_lightmaps.py
+!/game/bin/x64/lights.rad
+!/game/bin/x64/optix_kernels.ptx
+!/game/bin/x64/steam_api64.dll
+!/game/bin/x64/bsp_unit_tests/
+/game/bin/x64/bsp_unit_tests/control/
+/game/bin/x64/bsp_unit_tests/reference/
+/game/bin/x64/bsp_unit_tests/test/
+/game/bin/x64/bsp_unit_tests/*.log
+game/bin/x64/optix_kernels.ptx
+game/bin/x64/lights.rad
+*.prt
+*.vmx
