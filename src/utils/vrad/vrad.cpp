@@ -1903,6 +1903,9 @@ void RadWorld_Start() {
   // create directlights out of patches and lights
   CreateDirectLights();
 
+  // Precompute per-cluster light lists from PVS data
+  BuildPerClusterLightLists();
+
 #ifdef VRAD_RTX_CUDA_SUPPORT
   // Initialize GPU direct lighting with converted light data
   if (g_bUseGPU) {

@@ -319,6 +319,14 @@ extern bool debug_extra;
 extern directlight_t *activelights;
 extern directlight_t *freelights;
 
+// Per-cluster light lists: precomputed from PVS at setup time.
+// g_ClusterLights[cluster] points into g_ClusterLightStorage.
+// g_nClusterLights[cluster] is the count for that cluster.
+extern directlight_t **g_ClusterLights;
+extern int *g_nClusterLights;
+extern int g_nTotalClusterLightEntries;
+void BuildPerClusterLightLists();
+
 // because of hdr having two face lumps (light styles can cause them to be
 // different, among other things), we need to always access (r/w) face data
 // though this pointer

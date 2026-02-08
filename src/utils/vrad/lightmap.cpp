@@ -884,6 +884,16 @@ void CalcPoints(lightinfo_t *pLightInfo, facelight_t *pFaceLight, int ndxFace) {
 directlight_t *activelights;
 directlight_t *freelights;
 
+// Per-cluster light lists: precomputed from PVS at setup time.
+// g_ClusterLightFlat is a flat array of directlight_t* pointers.
+// g_ClusterLightOffsets[c] is the offset into g_ClusterLightFlat for cluster c.
+static directlight_t **g_ClusterLightFlat = nullptr;
+static int *g_ClusterLightOffsets = nullptr;
+directlight_t **g_ClusterLights =
+    nullptr; // unused externally, kept for header compat
+int *g_nClusterLights = nullptr;
+int g_nTotalClusterLightEntries = 0;
+
 facelight_t facelight[MAX_MAP_FACES];
 int numdlights;
 
@@ -1534,6 +1544,75 @@ void CreateDirectLights(void) {
     sortedLights[sortedLights.Count() - 1]->next = NULL;
   }
   // exit(1);
+}
+
+//=============================================================================
+// BuildPerClusterLightLists
+// Precompute per-cluster light arrays from PVS data. This replaces the
+// per-sample PVS checks with a one-time setup cost, so gather functions
+// iterate only lights visible from each cluster.
+//=============================================================================
+void BuildPerClusterLightLists() {
+  int numClusters = dvis->numclusters;
+  if (numClusters <= 0) {
+    Msg("No clusters \u2014 skipping per-cluster light list build.\n");
+    return;
+  }
+
+  // Allocate per-cluster count array
+  g_nClusterLights = new int[numClusters];
+  memset(g_nClusterLights, 0, numClusters * sizeof(int));
+
+  // First pass: count lights per cluster
+  for (directlight_t *dl = activelights; dl != NULL; dl = dl->next) {
+    for (int c = 0; c < numClusters; c++) {
+      if (PVSCheck(dl->pvs, c))
+        g_nClusterLights[c]++;
+    }
+  }
+
+  // Compute offsets and total size
+  g_ClusterLightOffsets = new int[numClusters];
+  g_nTotalClusterLightEntries = 0;
+  for (int c = 0; c < numClusters; c++) {
+    g_ClusterLightOffsets[c] = g_nTotalClusterLightEntries;
+    g_nTotalClusterLightEntries += g_nClusterLights[c];
+  }
+
+  // Allocate flat storage for all per-cluster light pointers
+  g_ClusterLightFlat = new directlight_t *[g_nTotalClusterLightEntries];
+
+  // Second pass: fill the per-cluster arrays
+  int *cursor = new int[numClusters];
+  memset(cursor, 0, numClusters * sizeof(int));
+
+  for (directlight_t *dl = activelights; dl != NULL; dl = dl->next) {
+    for (int c = 0; c < numClusters; c++) {
+      if (PVSCheck(dl->pvs, c)) {
+        g_ClusterLightFlat[g_ClusterLightOffsets[c] + cursor[c]++] = dl;
+      }
+    }
+  }
+
+  delete[] cursor;
+
+  // Statistics
+  int minLights = numdlights, maxLights = 0;
+  long long totalLights = 0;
+  for (int c = 0; c < numClusters; c++) {
+    int n = g_nClusterLights[c];
+    if (n < minLights)
+      minLights = n;
+    if (n > maxLights)
+      maxLights = n;
+    totalLights += n;
+  }
+  float avgLights = (numClusters > 0) ? (float)totalLights / numClusters : 0;
+
+  Msg("Per-cluster light lists: %d clusters, %d lights total\n", numClusters,
+      numdlights);
+  Msg("  Lights per cluster: avg=%.1f, min=%d, max=%d, entries=%d\n", avgLights,
+      minLights, maxLights, g_nTotalClusterLightEntries);
 }
 
 /*
@@ -2436,7 +2515,51 @@ static void GatherSampleLight_CollectGPURays(SSE_SampleInfo_t &info,
        (numSamples <= 2 || info.m_Clusters[0] == info.m_Clusters[2]) &&
        (numSamples <= 3 || info.m_Clusters[0] == info.m_Clusters[3]));
 
-  for (directlight_t *dl = activelights; dl != NULL; dl = dl->next) {
+  // Use per-cluster light lists when available (replaces activelights
+  // iteration) For allSameCluster: iterate only lights visible from cluster[0].
+  // For mixed clusters: iterate a merged set from all sample clusters.
+  int clusterLightCount = 0;
+  directlight_t **clusterLightList = nullptr;
+
+  // Merged-cluster temp buffer (only used for mixed-cluster case)
+  CUtlVector<directlight_t *> mergedLights;
+
+  if (g_ClusterLightFlat && allSameCluster && info.m_Clusters[0] >= 0) {
+    clusterLightList =
+        &g_ClusterLightFlat[g_ClusterLightOffsets[info.m_Clusters[0]]];
+    clusterLightCount = g_nClusterLights[info.m_Clusters[0]];
+  } else if (g_ClusterLightFlat && !allSameCluster) {
+    // Build union of lights from all sample clusters
+    for (int s = 0; s < numSamples; s++) {
+      int c = info.m_Clusters[s];
+      if (c < 0)
+        continue;
+      for (int li = 0; li < g_nClusterLights[c]; li++) {
+        directlight_t *dl = g_ClusterLightFlat[g_ClusterLightOffsets[c] + li];
+        if (mergedLights.Find(dl) == mergedLights.InvalidIndex())
+          mergedLights.AddToTail(dl);
+      }
+    }
+    clusterLightList = mergedLights.Base();
+    clusterLightCount = mergedLights.Count();
+  }
+
+  // Fallback: iterate all lights if no per-cluster data
+  bool useClusterList = (clusterLightList != nullptr && clusterLightCount > 0);
+
+  directlight_t *dl = useClusterList ? nullptr : activelights;
+  for (int li_idx = 0;; li_idx++) {
+    if (useClusterList) {
+      if (li_idx >= clusterLightCount)
+        break;
+      dl = clusterLightList[li_idx];
+    } else {
+      if (li_idx > 0)
+        dl = dl->next;
+      if (dl == nullptr)
+        break;
+    }
+
     // Early distance cull: only for lights with explicit hard-falloff
     // distances. Asymptotic falloff lights (without m_flEndFadeDistance) cannot
     // be safely distance-culled — even 0.4% cull rate caused 24.7% lightmap
@@ -2459,13 +2582,12 @@ static void GatherSampleLight_CollectGPURays(SSE_SampleInfo_t &info,
       }
     }
 
+    // PVS check: skip if using per-cluster lists for allSameCluster
+    // (already filtered). For mixed clusters, we still need per-sample masking.
     fltx4 dotMask;
     bool skipLight;
     if (allSameCluster) {
-      if (!PVSCheck(dl->pvs, info.m_Clusters[0])) {
-        g_nLightsSkippedPVS[iThread]++;
-        continue;
-      }
+      // Per-cluster lists already guarantee PVS visibility
       dotMask = Four_Ones;
       skipLight = false;
     } else {
@@ -2702,7 +2824,45 @@ static void GatherSampleLightAt4Points(SSE_SampleInfo_t &info, int sampleIdx,
 
   // Iterate over all direct lights and add them to the particular sample
   int cpuThread = info.m_iThread;
-  for (directlight_t *dl = activelights; dl != NULL; dl = dl->next) {
+  // Use per-cluster light lists when available
+  int clusterLightCount = 0;
+  directlight_t **clusterLightList = nullptr;
+  CUtlVector<directlight_t *> mergedLights;
+
+  if (g_ClusterLightFlat && allSameCluster && info.m_Clusters[0] >= 0) {
+    clusterLightList =
+        &g_ClusterLightFlat[g_ClusterLightOffsets[info.m_Clusters[0]]];
+    clusterLightCount = g_nClusterLights[info.m_Clusters[0]];
+  } else if (g_ClusterLightFlat && !allSameCluster) {
+    for (int s = 0; s < numSamples; s++) {
+      int c = info.m_Clusters[s];
+      if (c < 0)
+        continue;
+      for (int li = 0; li < g_nClusterLights[c]; li++) {
+        directlight_t *dl = g_ClusterLightFlat[g_ClusterLightOffsets[c] + li];
+        if (mergedLights.Find(dl) == mergedLights.InvalidIndex())
+          mergedLights.AddToTail(dl);
+      }
+    }
+    clusterLightList = mergedLights.Base();
+    clusterLightCount = mergedLights.Count();
+  }
+
+  bool useClusterList = (clusterLightList != nullptr && clusterLightCount > 0);
+
+  directlight_t *dl = useClusterList ? nullptr : activelights;
+  for (int li_idx = 0;; li_idx++) {
+    if (useClusterList) {
+      if (li_idx >= clusterLightCount)
+        break;
+      dl = clusterLightList[li_idx];
+    } else {
+      if (li_idx > 0)
+        dl = dl->next;
+      if (dl == nullptr)
+        break;
+    }
+
     // Early distance cull: only for lights with explicit hard-falloff
     // distances. (Same guard as GPU path — see comment above.)
     if (dl->facenum == -1 &&
@@ -2723,15 +2883,10 @@ static void GatherSampleLightAt4Points(SSE_SampleInfo_t &info, int sampleIdx,
       }
     }
 
-    // is this lights cluster visible?
+    // PVS check: skip for allSameCluster (per-cluster lists already filtered)
     fltx4 dotMask;
     bool skipLight;
     if (allSameCluster) {
-      // Fast path: single PVS check covers all samples
-      if (!PVSCheck(dl->pvs, info.m_Clusters[0])) {
-        g_nLightsSkippedPVS[cpuThread]++;
-        continue;
-      }
       dotMask = Four_Ones;
       skipLight = false;
     } else {
@@ -2820,8 +2975,51 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
     }
   }
 
-  // Iterate over all direct lights and add them to the particular sample
-  for (directlight_t *dl = activelights; dl != NULL; dl = dl->next) {
+  // Pre-compute whether all samples share the same cluster
+  bool allSameCluster = (info.m_Clusters[0] == info.m_Clusters[1] &&
+                         info.m_Clusters[0] == info.m_Clusters[2] &&
+                         info.m_Clusters[0] == info.m_Clusters[3]);
+
+  // Use per-cluster light lists when available
+  int clusterLightCount = 0;
+  directlight_t **clusterLightList = nullptr;
+  CUtlVector<directlight_t *> mergedLights;
+
+  if (g_ClusterLightFlat && allSameCluster && info.m_Clusters[0] >= 0) {
+    clusterLightList =
+        &g_ClusterLightFlat[g_ClusterLightOffsets[info.m_Clusters[0]]];
+    clusterLightCount = g_nClusterLights[info.m_Clusters[0]];
+  } else if (g_ClusterLightFlat && !allSameCluster) {
+    for (int s = 0; s < 4; s++) {
+      int c = info.m_Clusters[s];
+      if (c < 0)
+        continue;
+      for (int li = 0; li < g_nClusterLights[c]; li++) {
+        directlight_t *dl = g_ClusterLightFlat[g_ClusterLightOffsets[c] + li];
+        if (mergedLights.Find(dl) == mergedLights.InvalidIndex())
+          mergedLights.AddToTail(dl);
+      }
+    }
+    clusterLightList = mergedLights.Base();
+    clusterLightCount = mergedLights.Count();
+  }
+
+  bool useClusterList = (clusterLightList != nullptr && clusterLightCount > 0);
+
+  // Iterate over direct lights visible from sample clusters
+  directlight_t *dl = useClusterList ? nullptr : activelights;
+  for (int li_idx = 0;; li_idx++) {
+    if (useClusterList) {
+      if (li_idx >= clusterLightCount)
+        break;
+      dl = clusterLightList[li_idx];
+    } else {
+      if (li_idx > 0)
+        dl = dl->next;
+      if (dl == nullptr)
+        break;
+    }
+
     if ((flags & AMBIENT_ONLY) && (dl->light.type != emit_skyambient))
       continue;
 
@@ -2834,17 +3032,24 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
     if (dl->light.style != info.m_pFace->styles[lightStyleIndex])
       continue;
 
-    // is this lights cluster visible?
-    fltx4 dotMask = Four_Zeros;
-    bool skipLight = true;
-    for (int s = 0; s < 4; s++) {
-      if (PVSCheck(dl->pvs, info.m_Clusters[s])) {
-        dotMask = SetComponentSIMD(dotMask, s, 1.0f);
-        skipLight = false;
+    // PVS check: skip for allSameCluster (per-cluster lists already filtered)
+    fltx4 dotMask;
+    bool skipLight;
+    if (allSameCluster) {
+      dotMask = Four_Ones;
+      skipLight = false;
+    } else {
+      dotMask = Four_Zeros;
+      skipLight = true;
+      for (int s = 0; s < 4; s++) {
+        if (PVSCheck(dl->pvs, info.m_Clusters[s])) {
+          dotMask = SetComponentSIMD(dotMask, s, 1.0f);
+          skipLight = false;
+        }
       }
+      if (skipLight)
+        continue;
     }
-    if (skipLight)
-      continue;
 
     // NOTE: Notice here that if the light is on the back side of the face
     // (tested by checking the dot product of the face normal and the light
@@ -3311,7 +3516,45 @@ static void CollectSupersampleGroup(SSE_SampleInfo_t &info, int lightStyleIndex,
   CUtlVector<SSDeferredRay_t> &metaBuf = g_threadSSMeta[iThread];
   CUtlVector<SSAccumGroup> &groups = g_threadSSGroups[iThread];
 
-  for (directlight_t *dl = activelights; dl != NULL; dl = dl->next) {
+  // Use per-cluster light lists when available
+  int clusterLightCount = 0;
+  directlight_t **clusterLightList = nullptr;
+  CUtlVector<directlight_t *> mergedLights;
+
+  if (g_ClusterLightFlat && allSameCluster && info.m_Clusters[0] >= 0) {
+    clusterLightList =
+        &g_ClusterLightFlat[g_ClusterLightOffsets[info.m_Clusters[0]]];
+    clusterLightCount = g_nClusterLights[info.m_Clusters[0]];
+  } else if (g_ClusterLightFlat && !allSameCluster) {
+    for (int s = 0; s < 4; s++) {
+      int c = info.m_Clusters[s];
+      if (c < 0)
+        continue;
+      for (int li = 0; li < g_nClusterLights[c]; li++) {
+        directlight_t *dl = g_ClusterLightFlat[g_ClusterLightOffsets[c] + li];
+        if (mergedLights.Find(dl) == mergedLights.InvalidIndex())
+          mergedLights.AddToTail(dl);
+      }
+    }
+    clusterLightList = mergedLights.Base();
+    clusterLightCount = mergedLights.Count();
+  }
+
+  bool useClusterList = (clusterLightList != nullptr && clusterLightCount > 0);
+
+  directlight_t *dl = useClusterList ? nullptr : activelights;
+  for (int li_idx = 0;; li_idx++) {
+    if (useClusterList) {
+      if (li_idx >= clusterLightCount)
+        break;
+      dl = clusterLightList[li_idx];
+    } else {
+      if (li_idx > 0)
+        dl = dl->next;
+      if (dl == nullptr)
+        break;
+    }
+
     if ((flags & AMBIENT_ONLY) && (dl->light.type != emit_skyambient))
       continue;
     if ((flags & NON_AMBIENT_ONLY) && (dl->light.type == emit_skyambient))
@@ -3336,12 +3579,10 @@ static void CollectSupersampleGroup(SSE_SampleInfo_t &info, int lightStyleIndex,
         continue;
     }
 
-    // Cached PVS cluster check (ported from GatherSampleLight_CollectGPURays)
+    // PVS check: skip for allSameCluster (per-cluster lists already filtered)
     fltx4 dotMask;
     bool skipLight;
     if (allSameCluster) {
-      if (!PVSCheck(dl->pvs, info.m_Clusters[0]))
-        continue;
       dotMask = Four_Ones;
       skipLight = false;
     } else {
