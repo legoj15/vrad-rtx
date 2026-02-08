@@ -267,6 +267,7 @@ public:
 	CUtlVector<LightDesc_t> LightList;						//< the list of lights
 	CUtlVector<Vector> TriangleColors;						//< color of tries
 	CUtlVector<int32> TriangleMaterials;					//< material index of tries
+	CUtlVector<Vector> TriangleVertices;				//< 3 vertices per triangle for OptiX GAS
 
 public:
 	RayTracingEnvironment() : OptimizedTriangleList( 1024 )

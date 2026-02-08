@@ -6,6 +6,7 @@
 
 $Macro SRCDIR		"..\.."
 $Macro OUTBINDIR	"$SRCDIR\..\game\bin"
+$Macro OUTBINNAME	"vrad_rtx_dll"
 
 $Include "$SRCDIR\vpc_scripts\source_dll_base.vpc"
 
@@ -13,14 +14,23 @@ $Configuration
 {
 	$Compiler
 	{
-		$AdditionalIncludeDirectories		"$BASE,..\common,..\vmpi,..\vmpi\mysql\mysqlpp\include,..\vmpi\mysql\include"
-		$PreprocessorDefinitions			"$BASE;MPI" [$WIN32]
-		$PreprocessorDefinitions			"$BASE;PROTECTED_THINGS_DISABLE;VRAD"
+		$AdditionalIncludeDirectories		"$BASE;$SRCDIR\raytrace;$SRCDIR\utils\common;$(CUDA_PATH)\include"
+		$PreprocessorDefinitions			"$BASE;PROTECTED_THINGS_DISABLE;VRAD;VRAD_RTX_CUDA_SUPPORT"
 	}
 
 	$Linker
 	{
-		$AdditionalDependencies				"$BASE ws2_32.lib"
+		$AdditionalDependencies				"$BASE ws2_32.lib cuda.lib cudart.lib"
+		$AdditionalLibraryDirectories		"$BASE;$(CUDA_PATH)\lib\x64"
+	}
+
+	$PostBuildEvent [!$ANALYZE]
+	{
+		$CommandLine		"$BASE" \
+							"pushd $QUOTE$OUTBINDIR$QUOTE" "\n" \
+							"pwsh -ExecutionPolicy Bypass .\test_vrad_optix_quick.ps1" "\n" \
+							"popd" "\n"
+		$Description		"Running vrad_rtx quick test"
 	}
 }
 
@@ -39,8 +49,6 @@ $Project "VRAD"
 		$File	"$SRCDIR\public\loadcmdline.cpp"
 		$File	"$SRCDIR\public\lumpfiles.cpp"
 		$File	"macro_texture.cpp"
-		$File	"..\common\mpi_stats.cpp" [$WIN32]
-		$File	"mpivrad.cpp" [$WIN32]
 		$File	"$SRCDIR\public\filesystem_init.cpp" [!$WIN32]
 		$File	"..\common\filesystem_tools.cpp" [!$WIN32]
 		$File	"..\common\MySqlDatabase.cpp"
@@ -51,9 +59,9 @@ $Project "VRAD"
 		$File	"trace.cpp"
 		$File	"..\common\utilmatlib.cpp"
 		$File	"vismat.cpp"
-		$File	"..\common\vmpi_tools_shared.cpp" [$WIN32]
-		$File	"..\common\vmpi_tools_shared.h" [$WIN32]
 		$File	"vrad.cpp"
+		$File	"hardware_profiling.cpp"
+		$File	"direct_lighting_gpu_vrad.cpp"
 		$File	"VRAD_DispColl.cpp"
 		$File	"VradDetailProps.cpp"
 		$File	"VRadDisps.cpp"
@@ -95,11 +103,11 @@ $Project "VRAD"
 		$File	"lightmap.h"
 		$File	"macro_texture.h"
 		$File	"$SRCDIR\public\map_utils.h"
-		$File	"mpivrad.h" [$WIN32]
 		$File	"radial.h"
 		$File	"$SRCDIR\public\bitmap\tgawriter.h"
 		$File	"vismat.h"
 		$File	"vrad.h"
+		$File	"hardware_profiling.h"
 		$File	"VRAD_DispColl.h"
 		$File	"vraddetailprops.h"
 		$File	"vraddll.h"
@@ -109,24 +117,14 @@ $Project "VRAD"
 			$File	"..\common\bsplib.h"
 			$File	"..\common\cmdlib.h"
 			$File	"..\common\consolewnd.h"
-			$File	"..\vmpi\ichannel.h" [$WIN32]
-			$File	"..\vmpi\imysqlwrapper.h" [$WIN32]
-			$File	"..\vmpi\iphelpers.h" [$WIN32]
 			$File	"..\common\ISQLDBReplyTarget.h"
 			$File	"..\common\map_shared.h"
-			$File	"..\vmpi\messbuf.h" [$WIN32]
-			$File	"..\common\mpi_stats.h" [$WIN32]
 			$File	"..\common\MySqlDatabase.h"
 			$File	"..\common\pacifier.h"
 			$File	"..\common\polylib.h"
 			$File	"..\common\scriplib.h"
-			$File	"..\vmpi\threadhelpers.h" [$WIN32]
 			$File	"..\common\threads.h"
 			$File	"..\common\utilmatlib.h"
-			$File	"..\vmpi\vmpi_defs.h" [$WIN32]
-			$File	"..\vmpi\vmpi_dispatch.h" [$WIN32]
-			$File	"..\vmpi\vmpi_distribute_work.h" [$WIN32]
-			$File	"..\vmpi\vmpi_filesystem.h" [$WIN32]
 		}
 
 		$Folder	"Public Header Files"
@@ -203,7 +201,7 @@ $Project "VRAD"
 			$File	"$SRCDIR\public\mathlib\vector2d.h"
 			$File	"$SRCDIR\public\mathlib\vector4d.h"
 			$File	"$SRCDIR\public\mathlib\vmatrix.h"
-			$File	"..\vmpi\vmpi.h" [$WIN32]
+
 			$File	"$SRCDIR\public\vphysics_interface.h"
 			$File	"$SRCDIR\public\mathlib\vplane.h"
 			$File	"$SRCDIR\public\tier0\vprof.h"
@@ -220,10 +218,8 @@ $Project "VRAD"
 		$Lib mathlib
 		$Lib raytrace
 		$Lib tier2
-		$Lib vmpi [$WIN32]
 		$Lib vtf
 		$Lib "$LIBCOMMON/lzma"
-		$File "$SRCDIR\thirdparty\libcurl\lib\win32\libcurl.lib" [$WIN32]
 	}
 
 	$File	"notes.txt"

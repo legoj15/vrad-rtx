@@ -9,6 +9,7 @@ $Macro OUTLIBDIR	"$LIBCOMMON"
 
 $Include "$SRCDIR\vpc_scripts\source_lib_base.vpc"
 
+
 $Configuration
 {
 	$Compiler

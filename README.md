@@ -1,71 +1,101 @@
-# Source SDK 2013
+# VRAD-RTX
 
-Source code for Source SDK 2013.
+GPU-accelerated lightmap compiler for the Source Engine, built on NVIDIA OptiX and CUDA.
 
-Contains the game code for Half-Life 2, HL2: DM and TF2.
+VRAD-RTX is a fork of [Valve's Source SDK 2013](https://github.com/ValveSoftware/source-sdk-2013) that replaces the performance-critical ray tracing stages of **VRAD** (the Source Engine's radiosity lighting tool) with hardware-accelerated equivalents using NVIDIA's OptiX 9.1 RT cores.
 
-**Now including Team Fortress 2! ✨**
+## Features
 
-## Build instructions
+- **GPU Visibility Matrix** — Accelerated VisMatrix generation via OptiX ray tracing
+- **GPU Shadow Ray Batching** — Thread-local batched shadow rays for direct lighting, traced on the GPU
+- **GPU Radiosity Bounces** — Light bounce calculations offloaded to CUDA with per-thread streams
+- **Hardware Profiling** — Built-in system RAM, VRAM, CPU, and GPU usage logging
+- **Automated Regression Testing** — PowerShell 7.6+ test scripts with bit-identical and visual parity checks against the original `vrad.exe`
+- **CPU Parity** — CPU code path remains fully functional and produces identical results to stock VRAD
 
-Clone the repository using the following command:
+## Performance
 
-`git clone https://github.com/ValveSoftware/source-sdk-2013`
+The GPU path accelerates the most expensive phases of lightmap compilation:
 
-### Windows
+| Phase | Speedup |
+|---|---|
+| Visibility Matrix | ~6 s faster |
+| Direct Lighting | ~16 s faster |
+| Radiosity Bounces | ~29 s faster |
 
-Requirements:
- - Source SDK 2013 Multiplayer installed via Steam
- - Visual Studio 2022 with the following workload and components:
-   - Desktop development with C++:
-     - MSVC v143 - VS 2022 C++ x64/x86 build tools (Latest)
-     - Windows 11 SDK (10.0.22621.0) or Windows 10 SDK (10.0.19041.1)
- - Python 3.13 or later
+Results measured on a map with 100 bounces; actual gains depend on map complexity and GPU hardware.
 
-Inside the cloned directory, navigate to `src`, run:
-```bat
-createallprojects.bat
-```
-This will generate the Visual Studio project `everything.sln` which will be used to build your mod.
+## Requirements
 
-Then, on the menu bar, go to `Build > Build Solution`, and wait for everything to build.
+- **OS:** Windows 10/11 (x64)
+- **GPU:** NVIDIA GPU with RT cores (RTX 20-series or newer)
+- **CUDA Toolkit:** 12.x
+- **OptiX SDK:** 9.1
+- **Compiler:** Visual Studio 2022 (MSVC v143, Windows SDK 10.0.22621.0+)
+- **Runtime:** Source SDK Base 2013 Multiplayer (installed via Steam)
+- **Testing:** PowerShell 7.6+, Python 3.13+
 
-You can then select the `Client (Mod Name)` project you wish to run, right click and select `Set as Startup Project` and hit the big green `> Local Windows Debugger` button on the tool bar in order to launch your mod.
+## Building
 
-The default launch options should be already filled in for the `Release` configuration.
+1. Clone the repository:
+   ```
+   git clone https://github.com/legoj15/vrad-rtx.git
+   ```
 
-### Linux
+2. Navigate to `src` and generate the Visual Studio solution:
+   ```bat
+   createallprojects.bat
+   ```
 
-Requirements:
- - Source SDK 2013 Multiplayer installed via Steam
- - podman
+3. Open `everything.sln` in Visual Studio 2022 and build the `vrad_dll` project in **Release | x64**.
 
-Inside the cloned directory, navigate to `src`, run:
+4. The built `vrad_rtx.exe` and `vrad_dll.dll` are copied to `game/bin/x64/` automatically by the post-build step.
+
+## Usage
+
+Run VRAD-RTX as a drop-in replacement for `vrad.exe`:
+
 ```bash
-./buildallprojects
+# CPU only (identical to stock VRAD)
+vrad_rtx.exe path/to/mapname
+
+# GPU accelerated
+vrad_rtx.exe -cuda path/to/mapname
 ```
 
-This will build all the projects related to the SDK and your mods automatically against the Steam Runtime.
+All standard VRAD command-line options are supported.
 
-You can then, in the root of the cloned directory, you can navigate to `game` and run your mod by launching the build launcher for your mod project, eg:
-```bash
-./mod_tf
+## Testing
+
+The test suite lives in `game/bin/x64/` and validates correctness against the stock compiler:
+
+```powershell
+# Quick regression test (reference → control → GPU, with visual diff)
+.\test_vrad_optix_quick.ps1
+
+# Full regression test
+.\test_vrad_optix.ps1
 ```
 
-*Mods that are distributed on Steam MUST be built against the Steam Runtime, which the above steps will automatically do for you.*
+Tests compare BSP lightmaps byte-for-byte against both the original `vrad.exe` and the CPU-only `vrad_rtx.exe` path, with a visual screenshot fallback using `tgadiff.exe` when binary comparison fails.
 
-## Distributing your Mod
+## Project Structure
 
-There is guidance on distributing your mod both on and off Steam available at the following link:
-
-https://partner.steamgames.com/doc/sdk/uploading/distributing_source_engine
-
-## Additional Resources
-
-- [Valve Developer Wiki](https://developer.valvesoftware.com/wiki/Source_SDK_2013)
+```
+src/utils/vrad/              # Modified VRAD source
+  vrad.cpp                   # Main entry point (timing, GPU flag)
+  lightmap.cpp               # Core lightmap sampling & direct lighting
+  vismat.cpp                 # Visibility matrix (GPU path)
+  direct_lighting_gpu_vrad.cpp  # GPU direct lighting integration
+  hardware_profiling.cpp     # System resource monitoring
+  vrad_dll.vpc               # VPC project definition
+game/bin/x64/                # Runtime & test harness
+  test_vrad_optix_quick.ps1  # Quick regression test
+  test_vrad_optix.ps1        # Full regression test
+  bsp_diff_lightmaps.py      # Lightmap comparison utility
+  tgadiff.exe                # Visual diff tool
+```
 
 ## License
 
-The SDK is licensed to users on a non-commercial basis under the [SOURCE 1 SDK LICENSE](LICENSE), which is contained in the [LICENSE](LICENSE) file in the root of the repository.
-
-For more information, see [Distributing your Mod](#markdown-header-distributing-your-mod).
+This project is a fork of Valve's Source SDK 2013, licensed under the [SOURCE 1 SDK LICENSE](LICENSE).

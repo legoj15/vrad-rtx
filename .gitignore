@@ -502,3 +502,6 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+src/raytrace/nvcc_optix_stdout.txt
+src/raytrace/nvcc_stderr.txt
+src/raytrace/nvcc_stdout.txt
