@@ -533,3 +533,4 @@ game/mod_hl2mp
 !/game/bin/x64/test_vrad_optix_props.bat
 !/game/bin/x64/test_vrad_optix_radiosity.ps1
 !/game/bin/x64/test_vrad_optix_props.ps1
+/tools/benchmark/build
