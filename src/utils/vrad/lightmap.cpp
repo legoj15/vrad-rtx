@@ -1845,7 +1845,23 @@ void GatherSampleStandardLightSSE(SSE_sampleLightOutput_t &out,
   delta = src;
   delta -= pos;
   fltx4 dist2 = delta.length2();
-  fltx4 rpcDist = ReciprocalSqrtSIMD(dist2);
+  fltx4 rpcDist;
+  if (g_bPrecision) {
+    // Double Newton-Raphson iteration for higher-precision 1/sqrt
+    fltx4 guess = ReciprocalSqrtEstSIMD(dist2);
+    // First iteration: y = 0.5 * y * (3 - a*y^2)
+    guess =
+        MulSIMD(Four_PointFives,
+                MulSIMD(guess, SubSIMD(Four_Threes,
+                                       MulSIMD(dist2, MulSIMD(guess, guess)))));
+    // Second iteration for extra precision
+    rpcDist =
+        MulSIMD(Four_PointFives,
+                MulSIMD(guess, SubSIMD(Four_Threes,
+                                       MulSIMD(dist2, MulSIMD(guess, guess)))));
+  } else {
+    rpcDist = ReciprocalSqrtSIMD(dist2);
+  }
   delta *= rpcDist;
   fltx4 dist = SqrtEstSIMD(dist2); // delta.VectorNormalize();
 
@@ -1883,7 +1899,8 @@ void GatherSampleStandardLightSSE(SSE_sampleLightOutput_t &out,
     out.m_flFalloff =
         AddSIMD(out.m_flFalloff, MulSIMD(linear, falloffEvalDist));
     out.m_flFalloff = AddSIMD(out.m_flFalloff, constant);
-    out.m_flFalloff = ReciprocalSIMD(out.m_flFalloff);
+    out.m_flFalloff = g_bPrecision ? DivSIMD(Four_Ones, out.m_flFalloff)
+                                   : ReciprocalSIMD(out.m_flFalloff);
     break;
 
   case emit_surface:
@@ -1895,7 +1912,8 @@ void GatherSampleStandardLightSSE(SSE_sampleLightOutput_t &out,
     if (TestSignSIMD(CmpEqSIMD(Four_Zeros, dot)) == 0xF)
       return;
 
-    out.m_flFalloff = ReciprocalSIMD(dist2);
+    out.m_flFalloff =
+        g_bPrecision ? DivSIMD(Four_Ones, dist2) : ReciprocalSIMD(dist2);
     out.m_flFalloff = MulSIMD(out.m_flFalloff, dot2);
 
     // move the endpoint away from the surface by epsilon to prevent hitting the
@@ -1924,13 +1942,14 @@ void GatherSampleStandardLightSSE(SSE_sampleLightOutput_t &out,
     out.m_flFalloff =
         AddSIMD(out.m_flFalloff, MulSIMD(linear, falloffEvalDist));
     out.m_flFalloff = AddSIMD(out.m_flFalloff, constant);
-    out.m_flFalloff = ReciprocalSIMD(out.m_flFalloff);
+    out.m_flFalloff = g_bPrecision ? DivSIMD(Four_Ones, out.m_flFalloff)
+                                   : ReciprocalSIMD(out.m_flFalloff);
     out.m_flFalloff = MulSIMD(out.m_flFalloff, dot2);
 
     // outside the inner cone
     inFringe = CmpLeSIMD(dot2, ReplicateX4(dl->light.stopdot));
     mult = ReplicateX4(dl->light.stopdot - dl->light.stopdot2);
-    mult = ReciprocalSIMD(mult);
+    mult = g_bPrecision ? DivSIMD(Four_Ones, mult) : ReciprocalSIMD(mult);
     mult = MulSIMD(mult, SubSIMD(dot2, ReplicateX4(dl->light.stopdot2)));
     mult = MinSIMD(mult, Four_Ones);
     mult = MaxSIMD(mult, Four_Zeros);
@@ -1952,7 +1971,7 @@ void GatherSampleStandardLightSSE(SSE_sampleLightOutput_t &out,
   //	( dl->m_flEndFadeDistance - dl->m_flStartFadeDistance );
   if (bHasHardFalloff) {
     fltx4 t = ReplicateX4(dl->m_flEndFadeDistance - dl->m_flStartFadeDistance);
-    t = ReciprocalSIMD(t);
+    t = g_bPrecision ? DivSIMD(Four_Ones, t) : ReciprocalSIMD(t);
     t = MulSIMD(t, SubSIMD(dist, ReplicateX4(dl->m_flStartFadeDistance)));
 
     // clamp t to [0...1]

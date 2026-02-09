@@ -528,3 +528,8 @@ game/bin/x64/optix_kernels.ptx
 game/bin/x64/lights.rad
 *.prt
 *.vmx
+game/mod_hl2mp
+!/game/bin/x64/test_vrad_optix_radiosity.bat
+!/game/bin/x64/test_vrad_optix_props.bat
+!/game/bin/x64/test_vrad_optix_radiosity.ps1
+!/game/bin/x64/test_vrad_optix_props.ps1

@@ -283,6 +283,9 @@ extern bool g_bDisablePropSelfShadowing;
 // GPU Ray Tracing
 extern bool g_bUseGPU; // Enable CUDA GPU ray tracing acceleration
 
+// Precision mode: higher-accuracy lighting calculations at the cost of speed
+extern bool g_bPrecision;
+
 extern CUtlVector<char const *> g_NonShadowCastingMaterialStrings;
 extern void ForceTextureShadowsOnModel(const char *pModelName);
 extern bool IsModelTextureShadowsForced(const char *pModelName);

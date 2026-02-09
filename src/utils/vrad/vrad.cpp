@@ -86,6 +86,8 @@ char designer_lights[MAX_PATH] = "";
 char level_lights[MAX_PATH] = "";
 
 char vismatfile[_MAX_PATH] = "";
+
+bool g_bPrecision = false;
 char incrementfile[_MAX_PATH] = "";
 
 IIncremental *g_pIncremental = 0;
@@ -1353,8 +1355,18 @@ void CollectLight(Vector &total) {
       if ((int)patch->area != (int)(child1->area + child2->area))
         s1 = 0;
 
-      s1 = child1->area / (child1->area + child2->area);
-      s2 = child2->area / (child1->area + child2->area);
+      if (g_bPrecision) {
+        // Use double-precision for area-weighted averaging to avoid
+        // rounding errors when child areas differ significantly
+        double dArea1 = (double)child1->area;
+        double dArea2 = (double)child2->area;
+        double dTotal = dArea1 + dArea2;
+        s1 = (float)(dArea1 / dTotal);
+        s2 = (float)(dArea2 / dTotal);
+      } else {
+        s1 = child1->area / (child1->area + child2->area);
+        s2 = child2->area / (child1->area + child2->area);
+      }
 
       // patch->totallight = s1 * child1->totallight + s2 * child2->totallight
       for (j = 0; j < normalCount; j++) {
@@ -1458,6 +1470,10 @@ void GatherLight(int threadnum, void *pUserData) {
       Vector bumpSum[NUM_BUMP_VECTS + 1];
       Vector normals[NUM_BUMP_VECTS + 1];
 
+      // -precision: use double accumulators to reduce floating-point error
+      // across thousands of transfer summations per patch
+      double dbumpSum[NUM_BUMP_VECTS + 1][3];
+
       // Disps
       bool bDisp = (g_pFaces[patch->faceNumber].dispinfo != -1);
       if (bDisp) {
@@ -1487,6 +1503,9 @@ void GatherLight(int threadnum, void *pUserData) {
 
       for (i = 0; i < NUM_BUMP_VECTS + 1; i++) {
         VectorFill(bumpSum[i], 0);
+        if (g_bPrecision) {
+          dbumpSum[i][0] = dbumpSum[i][1] = dbumpSum[i][2] = 0.0;
+        }
       }
 
       float dot;
@@ -1504,33 +1523,65 @@ void GatherLight(int threadnum, void *pUserData) {
         float scale = 1.0f / DotProduct(delta, patch->normal);
         VectorScale(v, trans->transfer * scale, v);
 
-        Vector bumpTransfer;
-        for (i = 0; i < NUM_BUMP_VECTS + 1; i++) {
-          dot = DotProduct(delta, normals[i]);
-          if (dot <= 0) {
-            //						Assert( i > 0 ); // if
-            // this hits, then the transfer shouldn't be here.  It doesn't face
-            // the flat normal of this face!
-            continue;
+        if (g_bPrecision) {
+          for (i = 0; i < NUM_BUMP_VECTS + 1; i++) {
+            dot = DotProduct(delta, normals[i]);
+            if (dot <= 0)
+              continue;
+            dbumpSum[i][0] += (double)v[0] * dot;
+            dbumpSum[i][1] += (double)v[1] * dot;
+            dbumpSum[i][2] += (double)v[2] * dot;
           }
-          bumpTransfer = v * dot;
-          VectorAdd(bumpSum[i], bumpTransfer, bumpSum[i]);
+        } else {
+          Vector bumpTransfer;
+          for (i = 0; i < NUM_BUMP_VECTS + 1; i++) {
+            dot = DotProduct(delta, normals[i]);
+            if (dot <= 0) {
+              //						Assert( i > 0 );
+              //// if
+              // this hits, then the transfer shouldn't be here.  It doesn't
+              // face the flat normal of this face!
+              continue;
+            }
+            bumpTransfer = v * dot;
+            VectorAdd(bumpSum[i], bumpTransfer, bumpSum[i]);
+          }
         }
       }
       for (i = 0; i < NUM_BUMP_VECTS + 1; i++) {
-        VectorCopy(bumpSum[i], addlight[j].light[i]);
+        if (g_bPrecision) {
+          addlight[j].light[i].x = (float)dbumpSum[i][0];
+          addlight[j].light[i].y = (float)dbumpSum[i][1];
+          addlight[j].light[i].z = (float)dbumpSum[i][2];
+        } else {
+          VectorCopy(bumpSum[i], addlight[j].light[i]);
+        }
       }
     } else {
-      VectorFill(sum, 0);
-      for (k = 0; k < num; k++, trans++) {
-        for (i = 0; i < 3; i++) {
-          v[i] = emitlight[trans->patch][i] *
-                 g_Patches[trans->patch].reflectivity[i];
+      if (g_bPrecision) {
+        double dsum[3] = {0.0, 0.0, 0.0};
+        for (k = 0; k < num; k++, trans++) {
+          for (i = 0; i < 3; i++) {
+            dsum[i] += (double)(emitlight[trans->patch][i] *
+                                g_Patches[trans->patch].reflectivity[i]) *
+                       trans->transfer;
+          }
         }
-        VectorScale(v, trans->transfer, v);
-        VectorAdd(sum, v, sum);
+        addlight[j].light[0].x = (float)dsum[0];
+        addlight[j].light[0].y = (float)dsum[1];
+        addlight[j].light[0].z = (float)dsum[2];
+      } else {
+        VectorFill(sum, 0);
+        for (k = 0; k < num; k++, trans++) {
+          for (i = 0; i < 3; i++) {
+            v[i] = emitlight[trans->patch][i] *
+                   g_Patches[trans->patch].reflectivity[i];
+          }
+          VectorScale(v, trans->transfer, v);
+          VectorAdd(sum, v, sum);
+        }
+        VectorCopy(sum, addlight[j].light[0]);
       }
-      VectorCopy(sum, addlight[j].light[0]);
     }
   }
 }
@@ -2609,8 +2660,10 @@ int ParseCommandLine(int argc, char **argv, bool *onlydetail) {
       g_bDisablePropSelfShadowing = true;
     } else if (!Q_stricmp(argv[i], "-textureshadows")) {
       g_bTextureShadows = true;
-    } else if (!Q_stricmp(argv[i], "-cuda")) {
+    } else if (!Q_stricmp(argv[i], "-cuda") || !Q_stricmp(argv[i], "-rtx")) {
       g_bUseGPU = true;
+    } else if (!Q_stricmp(argv[i], "-precision")) {
+      g_bPrecision = true;
     } else if (!Q_stricmp(argv[i], "-nocuda")) {
       g_bUseGPU = false;
     } else if (!strcmp(argv[i], "-dump")) {
@@ -2869,6 +2922,12 @@ void PrintUsage(int argc, char **argv) {
       "Common options:\n"
       "\n"
       "  -v (or -verbose): Turn on verbose output (also shows more command\n"
+      "  -rtx (or -cuda) : Enable GPU acceleration for lighting.\n"
+      "  -precision      : Use higher-precision math for lighting "
+      "calculations.\n"
+      "                    Replaces fast approximations with full IEEE-754\n"
+      "                    division and double-precision radiosity "
+      "accumulation.\n"
       "  -bounce #       : Set max number of bounces (default: 100).\n"
       "  -fast           : Quick and dirty lighting.\n"
       "  -fastambient    : Per-leaf ambient sampling is lower quality to save "

@@ -5,8 +5,8 @@ if ($PSVersionTable.PSVersion.Major -lt 7 -or ($PSVersionTable.PSVersion.Major -
 }
 
 $MOD_DIR = "..\..\mod_hl2mp"
-$LOG_FILE = "test_vrad_optix.log"
-$MAP_NAME = "validation"
+$LOG_FILE = "test_vrad_optix_radiosity.log"
+$MAP_NAME = "validation_radiosity"
 
 $REF_DIR = "bsp_unit_tests\reference"
 $CONTROL_DIR = "bsp_unit_tests\control"
@@ -279,14 +279,14 @@ try {
     Write-LogMessage "`n--- Timing Summary ---"
     if ($HasReference) {
         $cachedLabel = if ($refTimeCached) { " (cached)" } else { "" }
-        Write-LogMessage "vrad.exe Time (Source SDK 2013 Unmodified):	$($refTime.TotalSeconds.ToString("F2"))s$cachedLabel"
+        Write-LogMessage "vrad.exe Time (Source SDK 2013 Unmodified):`t$($refTime.TotalSeconds.ToString("F2"))s$cachedLabel"
     }
-    Write-LogMessage "vrad_rtx.exe Time (CPU only):			$($controlTime.TotalSeconds.ToString("F2"))s"
+    Write-LogMessage "vrad_rtx.exe Time (CPU only):`t`t`t$($controlTime.TotalSeconds.ToString("F2"))s"
     if ($timedOut) {
-        Write-LogMessage "vrad_rtx.exe -cuda Time (GPU accelerated):	Did not finish"
+        Write-LogMessage "vrad_rtx.exe -cuda Time (GPU accelerated):`tDid not finish"
     }
     else {
-        Write-LogMessage "vrad_rtx.exe -cuda Time (GPU accelerated):	$($cudaTime.TotalSeconds.ToString("F2"))s"
+        Write-LogMessage "vrad_rtx.exe -cuda Time (GPU accelerated):`t$($cudaTime.TotalSeconds.ToString("F2"))s"
     }
 
     if (-not $timedOut) {
@@ -355,7 +355,7 @@ if ($tgaArgs.Count -gt 0) {
 
 $timestamp = (Get-Date).ToString("yyyy-MM-ddTHH-mm-ss")
 $logMap = @{
-    $LOG_FILE    = "${timestamp}_test_full.log"
+    $LOG_FILE    = "${timestamp}_test_radiosity.log"
     $REF_LOG     = "${timestamp}_vrad_reference.log"
     $CONTROL_LOG = "${timestamp}_vrad_control.log"
     $CUDA_LOG    = "${timestamp}_vrad_cuda.log"
