@@ -16,6 +16,7 @@ $Configuration
 	{
 		$AdditionalIncludeDirectories		"$BASE;$SRCDIR\raytrace;$SRCDIR\utils\common;$(CUDA_PATH)\include"
 		$PreprocessorDefinitions			"$BASE;PROTECTED_THINGS_DISABLE;VRAD;VRAD_RTX_CUDA_SUPPORT"
+		$EnableEnhancedInstructionSet		"Advanced Vector Extensions 2 (/arch:AVX2)"
 	}
 
 	$Linker

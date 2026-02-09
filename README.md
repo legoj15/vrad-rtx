@@ -28,6 +28,7 @@ Results measured on a map with 100 bounces; actual gains depend on map complexit
 ## Requirements
 
 - **OS:** Windows 10/11 (x64)
+- **CPU:** x64 processor with AVX2 and FMA3 support (Intel Haswell/2013+ or AMD Zen/2017+)
 - **GPU:** NVIDIA GPU with RT cores (RTX 20-series or newer)
 - **CUDA Toolkit:** 12.x
 - **OptiX SDK:** 9.1

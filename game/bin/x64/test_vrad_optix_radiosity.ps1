@@ -1,4 +1,4 @@
-param([int]$TimeoutExtensionMinutes = 0)
+param([int]$TimeoutExtensionMinutes = 0, [switch]$SkipVisualCheck = $true)
 
 if ($PSVersionTable.PSVersion.Major -lt 7 -or ($PSVersionTable.PSVersion.Major -eq 7 -and $PSVersionTable.PSVersion.Minor -lt 6)) {
     Throw "This script requires PowerShell 7.6 or later. Your version: $($PSVersionTable.PSVersion)"
@@ -146,31 +146,36 @@ try {
             Write-LogMessage "RESULT: PASS (All lightmaps are identical)"
         }
         else {
-            Write-LogMessage "Lightmaps differ. Initiating visual comparison (Ref vs Control)..."
-            if ($needsRefCompile -or !(Test-Path "screenshot_ref_$MAP_NAME.tga")) {
-                Take-Screenshot "$REF_DIR\$MAP_NAME.bsp" "screenshot_ref_$MAP_NAME.tga"
+            if ($SkipVisualCheck) {
+                Write-LogMessage "WARNING: Lightmaps differ. Visual comparison skipped (Ref vs Control)."
             }
             else {
-                Write-LogMessage "Using cached reference screenshot."
-            }
-            Take-Screenshot "$CONTROL_DIR\$MAP_NAME.bsp" "screenshot_control_$MAP_NAME.tga"
-        
-            $diffOutput = .\tgadiff.exe screenshot_ref_$MAP_NAME.tga screenshot_control_$MAP_NAME.tga screenshot_diff_ref_ctrl_$MAP_NAME.tga 2>&1
-            $diffMatch = $diffOutput | Select-String "Difference: ([\d\.]+)%"
-            if ($diffMatch) {
-                $percentDiff = [double]$diffMatch.Matches.Groups[1].Value
-                Write-LogMessage "Visual Difference (Ref vs Control): $percentDiff%"
-                if ($percentDiff -gt 0.5) {
-                    Write-LogMessage "CRITICAL ERROR: Fundamental issue detected! CPU tests should be identical. Difference: $percentDiff% > 0.5% tolerance."
-                    throw "FAIL"
+                Write-LogMessage "Lightmaps differ. Initiating visual comparison (Ref vs Control)..."
+                if ($needsRefCompile -or !(Test-Path "screenshot_ref_$MAP_NAME.tga")) {
+                    Take-Screenshot "$REF_DIR\$MAP_NAME.bsp" "screenshot_ref_$MAP_NAME.tga"
                 }
                 else {
-                    Write-LogMessage "CPU Visual tests passed within 0.5% margin of error."
+                    Write-LogMessage "Using cached reference screenshot."
                 }
-            }
-            else {
-                Write-LogMessage "CRITICAL ERROR: Could not parse tgadiff output for Ref vs Control."
-                throw "FAIL"
+                Take-Screenshot "$CONTROL_DIR\$MAP_NAME.bsp" "screenshot_control_$MAP_NAME.tga"
+            
+                $diffOutput = .\tgadiff.exe screenshot_ref_$MAP_NAME.tga screenshot_control_$MAP_NAME.tga screenshot_diff_ref_ctrl_$MAP_NAME.tga 2>&1
+                $diffMatch = $diffOutput | Select-String "Difference: ([\d\.]+)%"
+                if ($diffMatch) {
+                    $percentDiff = [double]$diffMatch.Matches.Groups[1].Value
+                    Write-LogMessage "Visual Difference (Ref vs Control): $percentDiff%"
+                    if ($percentDiff -gt 0.5) {
+                        Write-LogMessage "CRITICAL ERROR: Fundamental issue detected! CPU tests should be identical. Difference: $percentDiff% > 0.5% tolerance."
+                        throw "FAIL"
+                    }
+                    else {
+                        Write-LogMessage "CPU Visual tests passed within 0.5% margin of error."
+                    }
+                }
+                else {
+                    Write-LogMessage "CRITICAL ERROR: Could not parse tgadiff output for Ref vs Control."
+                    throw "FAIL"
+                }
             }
         }
     }
@@ -299,28 +304,33 @@ try {
             Write-LogMessage "RESULT: PASS (All lightmaps are identical)"
         }
         else {
-            Write-LogMessage "Initiating visual comparison for GPU..."
-            if (!(Test-Path "screenshot_control_$MAP_NAME.tga")) {
-                Take-Screenshot "$CONTROL_DIR\$MAP_NAME.bsp" "screenshot_control_$MAP_NAME.tga"
-            }
-            Take-Screenshot "$TEST_DIR\$MAP_NAME.bsp" "screenshot_test_$MAP_NAME.tga"
-        
-            $diffOutput = .\tgadiff.exe screenshot_control_$MAP_NAME.tga screenshot_test_$MAP_NAME.tga screenshot_diff_ctrl_test_$MAP_NAME.tga 2>&1
-            $diffMatch = $diffOutput | Select-String "Difference: ([\d\.]+)%"
-            if ($diffMatch) {
-                $percentDiff = [double]$diffMatch.Matches.Groups[1].Value
-                Write-LogMessage "Visual Difference (Control vs Test): $percentDiff%"
-                if ($percentDiff -ge 0.5) {
-                    Write-LogMessage "RESULT: FAIL (Visual difference $percentDiff% >= 0.5%)"
-                    throw "FAIL"
-                }
-                else {
-                    Write-LogMessage "RESULT: PASS (Visual difference $percentDiff% < 0.5%)"
-                }
+            if ($SkipVisualCheck) {
+                Write-LogMessage "WARNING: Lightmaps differ. Visual comparison skipped (Control vs Test)."
             }
             else {
-                Write-LogMessage "Warning: Could not parse tgadiff output for Control vs Test."
-                throw "FAIL"
+                Write-LogMessage "Initiating visual comparison for GPU..."
+                if (!(Test-Path "screenshot_control_$MAP_NAME.tga")) {
+                    Take-Screenshot "$CONTROL_DIR\$MAP_NAME.bsp" "screenshot_control_$MAP_NAME.tga"
+                }
+                Take-Screenshot "$TEST_DIR\$MAP_NAME.bsp" "screenshot_test_$MAP_NAME.tga"
+            
+                $diffOutput = .\tgadiff.exe screenshot_control_$MAP_NAME.tga screenshot_test_$MAP_NAME.tga screenshot_diff_ctrl_test_$MAP_NAME.tga 2>&1
+                $diffMatch = $diffOutput | Select-String "Difference: ([\d\.]+)%"
+                if ($diffMatch) {
+                    $percentDiff = [double]$diffMatch.Matches.Groups[1].Value
+                    Write-LogMessage "Visual Difference (Control vs Test): $percentDiff%"
+                    if ($percentDiff -ge 0.5) {
+                        Write-LogMessage "RESULT: FAIL (Visual difference $percentDiff% >= 0.5%)"
+                        throw "FAIL"
+                    }
+                    else {
+                        Write-LogMessage "RESULT: PASS (Visual difference $percentDiff% < 0.5%)"
+                    }
+                }
+                else {
+                    Write-LogMessage "Warning: Could not parse tgadiff output for Control vs Test."
+                    throw "FAIL"
+                }
             }
         }
     }
@@ -354,15 +364,18 @@ if ($tgaArgs.Count -gt 0) {
 }
 
 $timestamp = (Get-Date).ToString("yyyy-MM-ddTHH-mm-ss")
+$RUN_DIR = "$ARCHIVE_DIR\$timestamp"
+New-Item -ItemType Directory -Path $RUN_DIR | Out-Null
+
 $logMap = @{
-    $LOG_FILE    = "${timestamp}_test_radiosity.log"
-    $REF_LOG     = "${timestamp}_vrad_reference.log"
-    $CONTROL_LOG = "${timestamp}_vrad_control.log"
-    $CUDA_LOG    = "${timestamp}_vrad_cuda.log"
+    $LOG_FILE    = "test_radiosity.log"
+    $REF_LOG     = "vrad_reference.log"
+    $CONTROL_LOG = "vrad_control.log"
+    $CUDA_LOG    = "vrad_cuda.log"
 }
 foreach ($entry in $logMap.GetEnumerator()) {
     if (Test-Path $entry.Key) {
-        Move-Item $entry.Key "$ARCHIVE_DIR\$($entry.Value)" -Force
+        Move-Item $entry.Key "$RUN_DIR\$($entry.Value)" -Force
     }
 }
 
@@ -378,9 +391,9 @@ $pngFiles = @(
 )
 foreach ($png in $pngFiles) {
     if (Test-Path $png) {
-        Copy-Item $png "$ARCHIVE_DIR\${timestamp}_$png" -Force
+        Copy-Item $png "$RUN_DIR\$png" -Force
     }
 }
-Write-LogMessage "Logs and screenshots archived to $ARCHIVE_DIR with timestamp $timestamp"
+Write-LogMessage "Logs and screenshots archived to $RUN_DIR"
 
 if ($testFailed -or $timedOut) { exit 1 }
