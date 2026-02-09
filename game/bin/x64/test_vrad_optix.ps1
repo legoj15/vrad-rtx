@@ -128,7 +128,7 @@ try {
     $fullLogPath = Join-Path (Get-Location).Path $CONTROL_LOG
     Write-LogMessage "vrad_rtx.exe CPU Log: $fullLogPath"
     $start = Get-Date
-    & ".\vrad_rtx.exe" -game $MOD_DIR "$CONTROL_DIR\$MAP_NAME" *>$null
+    & ".\vrad_rtx.exe" -axv2 -game $MOD_DIR "$CONTROL_DIR\$MAP_NAME" *>$null
     if ($LASTEXITCODE -ne 0) {
         Write-LogMessage "CRITICAL ERROR: vrad_rtx.exe (control, CPU only) failed with exit code $LASTEXITCODE."
         throw "FAIL"
@@ -183,7 +183,7 @@ try {
     # --- Phase 3: Test Run (vrad_rtx.exe -cuda) ---
     Write-LogMessage "--- Compiling test map (vrad_rtx.exe -cuda) ---"
     $fullLogPath = Join-Path (Get-Location).Path $CUDA_LOG
-    Write-LogMessage "vrad_rtx.exe -cuda Log: $fullLogPath"
+    Write-LogMessage "vrad_rtx.exe -avx2 -cuda Log: $fullLogPath"
     $start = Get-Date
 
     # Use .NET Process class with event-based async output draining.

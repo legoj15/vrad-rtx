@@ -12,9 +12,16 @@
 #include <xmmintrin.h>
 #endif
 
+// Runtime AVX2/FMA3/SSE4.1 opt-in flag (set by -avx2 command line argument).
+// When compiled with /arch:AVX2 the upgraded intrinsics are available but
+// gated behind this flag so the default code path remains SSE2-identical.
+#ifdef __AVX2__
+#include <immintrin.h>
+extern bool g_bUseAVX2;
+#endif
+
 #include <mathlib/mathlib.h>
 #include <mathlib/vector.h>
-
 
 #if defined(GNUC)
 #define USE_STDC_FOR_SIMD 0
@@ -1766,11 +1773,11 @@ FORCEINLINE fltx4 LoadOneSIMD(void) { return Four_Ones; }
 FORCEINLINE fltx4 MaskedAssign(const fltx4 &ReplacementMask,
                                const fltx4 &NewValue, const fltx4 &OldValue) {
 #ifdef __AVX2__
-  return _mm_blendv_ps(OldValue, NewValue, ReplacementMask);
-#else
+  if (g_bUseAVX2)
+    return _mm_blendv_ps(OldValue, NewValue, ReplacementMask);
+#endif
   return OrSIMD(AndSIMD(ReplacementMask, NewValue),
                 AndNotSIMD(ReplacementMask, OldValue));
-#endif
 }
 
 // the same as MaskedAssign, only 5 instructions instead of 6
@@ -1873,20 +1880,20 @@ FORCEINLINE fltx4 MaddSIMD(const fltx4 &a, const fltx4 &b,
                            const fltx4 &c) // a*b + c
 {
 #ifdef __AVX2__
-  return _mm_fmadd_ps(a, b, c);
-#else
-  return AddSIMD(MulSIMD(a, b), c);
+  if (g_bUseAVX2)
+    return _mm_fmadd_ps(a, b, c);
 #endif
+  return AddSIMD(MulSIMD(a, b), c);
 }
 
 FORCEINLINE fltx4 MsubSIMD(const fltx4 &a, const fltx4 &b,
                            const fltx4 &c) // c - a*b
 {
 #ifdef __AVX2__
-  return _mm_fnmadd_ps(a, b, c);
-#else
-  return SubSIMD(c, MulSIMD(a, b));
+  if (g_bUseAVX2)
+    return _mm_fnmadd_ps(a, b, c);
 #endif
+  return SubSIMD(c, MulSIMD(a, b));
 };
 
 FORCEINLINE fltx4 Dot3SIMD(const fltx4 &a, const fltx4 &b) {
@@ -2042,15 +2049,15 @@ FORCEINLINE fltx4 MaxSIMD(const fltx4 &a, const fltx4 &b) // max(a,b)
 // Round towards positive infinity
 FORCEINLINE fltx4 CeilSIMD(const fltx4 &a) {
 #ifdef __AVX2__
-  return _mm_ceil_ps(a);
-#else
+  if (g_bUseAVX2)
+    return _mm_ceil_ps(a);
+#endif
   fltx4 retVal;
   SubFloat(retVal, 0) = ceil(SubFloat(a, 0));
   SubFloat(retVal, 1) = ceil(SubFloat(a, 1));
   SubFloat(retVal, 2) = ceil(SubFloat(a, 2));
   SubFloat(retVal, 3) = ceil(SubFloat(a, 3));
   return retVal;
-#endif
 }
 
 fltx4 fabs(const fltx4 &x);
@@ -2061,13 +2068,13 @@ fltx4 fabs(const fltx4 &x);
 // VMX, which has a native floor op.
 FORCEINLINE fltx4 FloorSIMD(const fltx4 &val) {
 #ifdef __AVX2__
-  return _mm_floor_ps(val);
-#else
+  if (g_bUseAVX2)
+    return _mm_floor_ps(val);
+#endif
   fltx4 fl4Abs = fabs(val);
   fltx4 ival = SubSIMD(AddSIMD(fl4Abs, Four_2ToThe23s), Four_2ToThe23s);
   ival = MaskedAssign(CmpGtSIMD(ival, fl4Abs), SubSIMD(ival, Four_Ones), ival);
   return XorSIMD(ival, XorSIMD(val, fl4Abs)); // restore sign bits
-#endif
 }
 
 inline bool IsAllZeros(const fltx4 &var) {

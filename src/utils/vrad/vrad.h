@@ -286,6 +286,9 @@ extern bool g_bUseGPU; // Enable CUDA GPU ray tracing acceleration
 // Precision mode: higher-accuracy lighting calculations at the cost of speed
 extern bool g_bPrecision;
 
+// AVX2 mode: use FMA3/SSE4.1 SIMD instructions (opt-in via -avx2 flag)
+extern bool g_bUseAVX2;
+
 extern CUtlVector<char const *> g_NonShadowCastingMaterialStrings;
 extern void ForceTextureShadowsOnModel(const char *pModelName);
 extern bool IsModelTextureShadowsForced(const char *pModelName);

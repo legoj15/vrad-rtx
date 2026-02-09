@@ -88,6 +88,7 @@ char level_lights[MAX_PATH] = "";
 char vismatfile[_MAX_PATH] = "";
 
 bool g_bPrecision = false;
+bool g_bUseAVX2 = false;
 char incrementfile[_MAX_PATH] = "";
 
 IIncremental *g_pIncremental = 0;
@@ -2664,6 +2665,8 @@ int ParseCommandLine(int argc, char **argv, bool *onlydetail) {
       g_bUseGPU = true;
     } else if (!Q_stricmp(argv[i], "-precision")) {
       g_bPrecision = true;
+    } else if (!Q_stricmp(argv[i], "-avx2")) {
+      g_bUseAVX2 = true;
     } else if (!Q_stricmp(argv[i], "-nocuda")) {
       g_bUseGPU = false;
     } else if (!strcmp(argv[i], "-dump")) {
@@ -2928,6 +2931,9 @@ void PrintUsage(int argc, char **argv) {
       "                    Replaces fast approximations with full IEEE-754\n"
       "                    division and double-precision radiosity "
       "accumulation.\n"
+      "  -avx2           : Use AVX2/FMA3/SSE4.1 SIMD instructions for\n"
+      "                    ~10-20%% faster math (requires Haswell+ or "
+      "Zen+).\n"
       "  -bounce #       : Set max number of bounces (default: 100).\n"
       "  -fast           : Quick and dirty lighting.\n"
       "  -fastambient    : Per-leaf ambient sampling is lower quality to save "

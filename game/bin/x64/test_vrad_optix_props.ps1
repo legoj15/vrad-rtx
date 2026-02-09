@@ -1,4 +1,4 @@
-param([int]$TimeoutExtensionMinutes = 0, [switch]$SkipVisualCheck = $true)
+param([int]$TimeoutExtensionMinutes = 0, [switch]$SkipVisualCheck = $false)
 
 if ($PSVersionTable.PSVersion.Major -lt 7 -or ($PSVersionTable.PSVersion.Major -eq 7 -and $PSVersionTable.PSVersion.Minor -lt 6)) {
     Throw "This script requires PowerShell 7.6 or later. Your version: $($PSVersionTable.PSVersion)"
