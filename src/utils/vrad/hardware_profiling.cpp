@@ -313,3 +313,73 @@ void HardwareProfile_PrintSummary() {
 
   ShutdownNVML();
 }
+
+//-----------------------------------------------------------------------------
+// Auto-compute optimal GPU ray batch size from available physical memory.
+//
+// Memory model per thread (threshold counts g_threadRays entries):
+//   g_threadRays:       RayBatch             (36 bytes/ray)
+//   g_threadShadowRays: DeferredShadowRay_t  (~26 bytes/ray amortized,
+//                       since each 104-byte meta covers ~4 rays on average)
+//   Subtotal:           ~62 bytes/ray steady-state
+//
+//   CUtlVector doubling: peak memory during growth is ~3× steady state
+//   (old buffer + new buffer coexist during realloc-copy).
+//   Effective per-ray: ~62 × 3 ≈ 200 bytes
+//
+//   RayResult (20 bytes/ray) is allocated during flush but freed immediately,
+//   so it doesn't stack with the growth overhead.
+//
+// Budget: 25% of available physical RAM (leaves 75% for VRAD's base data:
+// patches, lightmaps, cluster light lists, face data, etc.)
+//-----------------------------------------------------------------------------
+int AutoComputeGPURayBatchSize(int numThreads) {
+  const int MIN_BATCH = 50000;
+  const int MAX_BATCH = 2000000; // 2M rays — TraceBatch internally chunks at 1M
+  const int FALLBACK = 500000;   // 500K conservative fallback
+  const int BYTES_PER_RAY =
+      82; // 36 RayBatch + 26 DeferredShadowRay_t share + 20 RayResult transient
+
+  if (numThreads < 1)
+    numThreads = 1;
+
+#ifdef _WIN32
+  // Query available physical RAM
+  MEMORYSTATUSEX memInfo = {};
+  memInfo.dwLength = sizeof(memInfo);
+  if (!GlobalMemoryStatusEx(&memInfo)) {
+    Msg("  AutoBatch: GlobalMemoryStatusEx failed, using fallback %d\n",
+        FALLBACK);
+    return FALLBACK;
+  }
+
+  unsigned long long availPhysBytes = memInfo.ullAvailPhys;
+  unsigned long long totalPhysBytes = memInfo.ullTotalPhys;
+
+  // Budget: 50% of available RAM. Ray buffers are transient and small
+  // relative to face data — being generous here improves GPU throughput
+  // by reducing flush frequency and mutex contention.
+  unsigned long long budget = availPhysBytes / 2;
+
+  // Compute per-thread ray count
+  unsigned long long perThread =
+      budget / ((unsigned long long)numThreads * BYTES_PER_RAY);
+
+  int result = (int)min(perThread, (unsigned long long)MAX_BATCH);
+  result = max(result, MIN_BATCH);
+
+  // Log details for diagnostics
+  double budgetGB = (double)budget / (1024.0 * 1024.0 * 1024.0);
+  double perThreadMB = (double)result * BYTES_PER_RAY / (1024.0 * 1024.0);
+  Msg("  AutoBatch: %.1f GB avail / %.1f GB total, budget=%.1f GB, "
+      "%d threads -> %d rays/thread (%.0f MB/thread peak)\n",
+      (double)availPhysBytes / (1024.0 * 1024.0 * 1024.0),
+      (double)totalPhysBytes / (1024.0 * 1024.0 * 1024.0), budgetGB, numThreads,
+      result, perThreadMB);
+
+  return result;
+#else
+  // Non-Windows: use fallback
+  return FALLBACK;
+#endif
+}

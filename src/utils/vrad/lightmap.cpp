@@ -2719,8 +2719,10 @@ static void GatherSampleLight_CollectGPURays(SSE_SampleInfo_t &info,
   }
 }
 
-// Max rays per thread before flushing to GPU (1M rays = ~36 MB per thread)
-static const int GPU_RAY_FLUSH_THRESHOLD = 1000000;
+// Max rays per thread before flushing to GPU.
+// Controlled by -gpuraybatch CLI arg (default 250K = ~9 MB per thread).
+// Lower values reduce peak RAM at the cost of more frequent GPU submissions.
+#define GPU_RAY_FLUSH_THRESHOLD g_nGPURayBatchSize
 
 //-----------------------------------------------------------------------------
 // Flush a single thread's accumulated rays: trace on GPU, apply results.
@@ -3901,7 +3903,8 @@ static void FlushSingleThreadSSRays(int t) {
 }
 
 // Threshold: flush when a single thread accumulates this many rays.
-static const int GPU_SS_RAY_FLUSH_THRESHOLD = 2 * 1024 * 1024; // 2M rays
+// Uses 2x the direct-lighting threshold since SS runs one thread at a time.
+#define GPU_SS_RAY_FLUSH_THRESHOLD (g_nGPURayBatchSize * 2)
 
 //-----------------------------------------------------------------------------
 // Phase 2: Flush all threads' supersample ray buffers, one thread at a time.
@@ -4007,6 +4010,14 @@ void FinalizeFacelights(int iThread, int facenum) {
     // memory.  FlushSingleThreadSSRays acquires the GPU mutex internally.
     if (g_threadSSRays[iThread].Count() >= GPU_SS_RAY_FLUSH_THRESHOLD)
       FlushSingleThreadSSRays(iThread);
+  }
+
+  // Free windings NOW — CollectSupersampleGPU_Face has already consumed them
+  // for winding-clipping checks. Waiting until ApplySupersampleAndCleanup
+  // would keep ALL faces' windings alive across the entire pipeline, adding
+  // tens of GB of peak memory on large maps.
+  if (!g_bDumpPatches) {
+    FreeSampleWindings(fl);
   }
 }
 #endif // VRAD_RTX_CUDA_SUPPORT

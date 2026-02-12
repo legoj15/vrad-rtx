@@ -140,6 +140,9 @@ bool g_bDisablePropSelfShadowing = false;
 
 // GPU Ray Tracing
 bool g_bUseGPU = false;
+int g_nGPURayBatchSize =
+    500000; // 500K rays/thread default (auto-compute overrides)
+static bool g_bGPURayBatchUserSet = false; // true if user passed -gpuraybatch
 
 CUtlVector<byte> g_FacesVisibleToLights;
 
@@ -2148,6 +2151,20 @@ bool RadWorld_Go() {
 
     // Sub-phase: BuildFacelights (CPU threaded)
     phaseStart = Plat_FloatTime();
+
+#ifdef VRAD_RTX_CUDA_SUPPORT
+    // Auto-compute ray batch threshold before BuildFacelights starts,
+    // since per-thread flush checks use g_nGPURayBatchSize during the build.
+    if (g_bUseGPU && !g_bGPURayBatchUserSet) {
+      g_nGPURayBatchSize = AutoComputeGPURayBatchSize(numthreads);
+    }
+    if (g_bUseGPU) {
+      Msg("GPU ray batch threshold: %d rays/thread [%s] (%.1f MB/thread)\n",
+          g_nGPURayBatchSize, g_bGPURayBatchUserSet ? "manual" : "auto",
+          (float)g_nGPURayBatchSize * 76.0f / (1024.0f * 1024.0f));
+    }
+#endif
+
     RunThreadsOnIndividual(numfaces, true, BuildFacelights);
     double buildFacelightsTime = Plat_FloatTime() - phaseStart;
 
@@ -2663,6 +2680,18 @@ int ParseCommandLine(int argc, char **argv, bool *onlydetail) {
       g_bTextureShadows = true;
     } else if (!Q_stricmp(argv[i], "-cuda") || !Q_stricmp(argv[i], "-rtx")) {
       g_bUseGPU = true;
+    } else if (!Q_stricmp(argv[i], "-gpuraybatch")) {
+      if (++i < argc) {
+        g_nGPURayBatchSize = atoi(argv[i]);
+        if (g_nGPURayBatchSize < 1000) {
+          Warning("Error: -gpuraybatch must be >= 1000\n");
+          return -1;
+        }
+        g_bGPURayBatchUserSet = true;
+      } else {
+        Warning("Error: expected a value after '-gpuraybatch'\n");
+        return -1;
+      }
     } else if (!Q_stricmp(argv[i], "-precision")) {
       g_bPrecision = true;
     } else if (!Q_stricmp(argv[i], "-avx2")) {
@@ -2926,6 +2955,9 @@ void PrintUsage(int argc, char **argv) {
       "\n"
       "  -v (or -verbose): Turn on verbose output (also shows more command\n"
       "  -rtx (or -cuda) : Enable GPU acceleration for lighting.\n"
+      "  -gpuraybatch #   : Max rays buffered per thread before GPU flush\n"
+      "                     (default 250000). Lower to reduce RAM usage on\n"
+      "                     extreme maps.\n"
       "  -precision      : Use higher-precision math for lighting "
       "calculations.\n"
       "                    Replaces fast approximations with full IEEE-754\n"
