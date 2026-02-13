@@ -5,10 +5,12 @@
 #ifndef RAYTRACE_OPTIX_H
 #define RAYTRACE_OPTIX_H
 
+#include "gpu_scene_data.h"
 #include "mathlib/vector.h"
 #include "raytrace_shared.h"
 #include "tier1/utlblockmemory.h"
 #include "tier1/utlvector.h"
+
 
 #include "visibility_gpu.h"
 
@@ -48,6 +50,9 @@ public:
   static void TraceBatch(const RayBatch *rays, RayResult *results,
                          int num_rays);
 
+  // Direct Lighting (Phase 2)
+  static void TraceDirectLighting(int numSamples);
+
   // Device info
   static const char *GetDeviceName() { return s_szDeviceName; }
   static int GetDeviceMemoryMB() { return s_nDeviceMemoryMB; }
@@ -65,10 +70,8 @@ private:
   static void *s_raygenPG;
   static void *s_missPG;
   static void *s_hitgroupPG;
-  static void *s_visRaygenPG; // Separate raygen for visibility kernel?
-                              // Actually we might just use a separate kernel or
-                              // valid raygen. For now, assume we extend the
-                              // pipeline or use specific entry points.
+  static void *s_visRaygenPG;            // Visibility kernel raygen
+  static void *s_directLightingRaygenPG; // Direct lighting kernel raygen
 
   // Acceleration structure
   static void *s_d_gas_output_buffer;

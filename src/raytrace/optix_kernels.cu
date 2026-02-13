@@ -3,6 +3,7 @@
 // Compiled to PTX and loaded at runtime
 //========================================================================
 
+#include "gpu_scene_data.h"
 #include "visibility_gpu.h"
 #include <optix.h>
 #include <optix_device.h>
@@ -11,6 +12,43 @@
 // Note: This is compiled separately, so we define the structs inline
 // UPDATE: Now we use visibility_gpu.h which includes raytrace_shared.h
 // So we must NOT redefine these structs.
+
+//-----------------------------------------------------------------------------
+// GPU Light Structure - must match GPULight in direct_lighting_gpu.h
+// NOTE: Uses explicit float fields (not float3_t) to guarantee identical
+// struct layout between MSVC (host) and NVCC (device PTX) compilation.
+//-----------------------------------------------------------------------------
+struct GPULight {
+  float origin_x, origin_y, origin_z;
+  float intensity_x, intensity_y, intensity_z;
+  float normal_x, normal_y, normal_z; // For emit_surface and emit_spotlight
+
+  int type; // emit_point=0, emit_surface=1, emit_spotlight=2, emit_skylight=3
+  int facenum; // -1 for point lights, face index for surface lights
+
+  // Attenuation
+  float constant_attn;
+  float linear_attn;
+  float quadratic_attn;
+
+  // Spotlight parameters
+  float stopdot;  // cos(inner cone angle)
+  float stopdot2; // cos(outer cone angle)
+  float exponent;
+
+  // Fade distances
+  float startFadeDistance;
+  float endFadeDistance;
+  float capDist;
+};
+
+// Light type enums (must match emittype_t in bspfile.h)
+#define EMIT_SURFACE 0
+#define EMIT_POINT 1
+#define EMIT_SPOTLIGHT 2
+#define EMIT_SKYLIGHT 3
+#define EMIT_QUAKELIGHT 4
+#define EMIT_SKYAMBIENT 5
 
 //-----------------------------------------------------------------------------
 // Launch Parameters - must match host struct exactly
@@ -31,6 +69,17 @@ struct OptixLaunchParams {
   VisiblePair *visible_pairs;
   int *pair_count_atomic;
   int max_pairs;
+
+  // Direct Lighting Extension (Phase 2)
+  const GPUSampleData *d_samples;
+  const GPULight *d_lights;
+  const GPUClusterLightList *d_clusterLists;
+  const int *d_clusterLightIndices;
+  const GPUFaceInfo *d_faceInfos;
+  GPULightOutput *d_lightOutput;
+  int num_samples;
+  int num_lights;
+  int num_clusters;
 };
 
 extern "C" __constant__ OptixLaunchParams params;
@@ -267,6 +316,301 @@ extern "C" __global__ void __raygen__cluster_visibility() {
           params.visible_pairs[idx].receiver = receiverPatchID;
         }
       }
+    }
+  }
+}
+
+//=============================================================================
+// Phase 2: Direct Lighting Kernel
+//
+// Each thread processes ONE lightmap sample.
+// For each sample, iterates over all lights visible from the sample's PVS
+// cluster, computes falloff + dot product (replicating CPU
+// GatherSampleStandardLightSSE math), traces an inline shadow ray for
+// occlusion, and atomicAdd's the contribution to the output buffer.
+//
+// Only handles emit_point (0), emit_surface (1), emit_spotlight (2).
+// Sky lights (3, 4) stay on CPU.
+//=============================================================================
+
+// DIST_EPSILON from Source Engine (bspfile.h)
+#define GPU_DIST_EPSILON 0.03125f
+
+//-----------------------------------------------------------------------------
+// Inline shadow trace: returns 1.0 if visible, 0.0 if occluded
+//-----------------------------------------------------------------------------
+__forceinline__ __device__ float TraceShadowRay(float3 origin, float3 direction,
+                                                float tmax) {
+  // Shadow ray: we only need boolean hit/miss
+  // Use OPTIX_RAY_FLAG_NONE to allow any-hit to filter skip_id
+  unsigned int p0 = __float_as_uint(1e30f);
+  unsigned int p1 = (unsigned int)-1;
+  unsigned int p2 = 0, p3 = 0, p4 = 0;
+  unsigned int p5 = (unsigned int)-1; // No skip ID for shadow rays
+
+  optixTrace(params.traversable, origin, direction,
+             1e-3f, // tmin: larger than 1e-4 to avoid self-shadow artifacts
+             tmax,  // tmax: distance to light
+             0.0f,  // rayTime
+             OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1,
+             0, // SBT offset, stride, miss index
+             p0, p1, p2, p3, p4, p5);
+
+  // Miss (hit_id == -1) means visible
+  return ((int)p1 == -1) ? 1.0f : 0.0f;
+}
+
+//-----------------------------------------------------------------------------
+// Direct Lighting Ray Generation
+// 1D launch: one thread per lightmap sample
+//-----------------------------------------------------------------------------
+extern "C" __global__ void __raygen__direct_lighting() {
+  const int sampleIdx = optixGetLaunchIndex().x;
+
+  if (sampleIdx >= params.num_samples)
+    return;
+
+  // Load sample data
+  const GPUSampleData &sample = params.d_samples[sampleIdx];
+  float3 samplePos =
+      make_float3(sample.position.x, sample.position.y, sample.position.z);
+  float3 sampleNormal =
+      make_float3(sample.normal.x, sample.normal.y, sample.normal.z);
+  int clusterIdx = sample.clusterIndex;
+
+  // If sample has no valid cluster, skip (can't look up lights)
+  if (clusterIdx < 0 || clusterIdx >= params.num_clusters)
+    return;
+
+  // Load per-face bump info
+  const GPUFaceInfo &faceInfo = params.d_faceInfos[sample.faceIndex];
+  int normalCount = faceInfo.normalCount; // 1 or 4
+
+  // Build bump normal array for this face
+  // bumpNormal[0] = flat normal (from sample), bumpNormal[1..3] = bump basis
+  float3 bumpNormals[4];
+  bumpNormals[0] = sampleNormal;
+  if (normalCount > 1) {
+    bumpNormals[1] = make_float3(faceInfo.bumpNormal0_x, faceInfo.bumpNormal0_y,
+                                 faceInfo.bumpNormal0_z);
+    bumpNormals[2] = make_float3(faceInfo.bumpNormal1_x, faceInfo.bumpNormal1_y,
+                                 faceInfo.bumpNormal1_z);
+    bumpNormals[3] = make_float3(faceInfo.bumpNormal2_x, faceInfo.bumpNormal2_y,
+                                 faceInfo.bumpNormal2_z);
+  }
+
+  // Look up which lights are visible from this cluster
+  const GPUClusterLightList &clusterList = params.d_clusterLists[clusterIdx];
+  int lightOffset = clusterList.lightOffset;
+  int lightCount = clusterList.lightCount;
+
+  // Accumulators for this sample — one per bump vector
+  float accumR[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float accumG[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float accumB[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  // Iterate over all lights visible from this cluster
+  for (int li = 0; li < lightCount; li++) {
+    int lightIdx = params.d_clusterLightIndices[lightOffset + li];
+    if (lightIdx < 0 || lightIdx >= params.num_lights)
+      continue;
+
+    const GPULight &light = params.d_lights[lightIdx];
+
+    // Skip sky lights — they stay on CPU
+    if (light.type == EMIT_SKYLIGHT || light.type == EMIT_SKYAMBIENT)
+      continue;
+
+    // ---------------------------------------------------------------
+    // Compute delta = lightOrigin - samplePos
+    // ---------------------------------------------------------------
+    float3 lightOrigin =
+        make_float3(light.origin_x, light.origin_y, light.origin_z);
+    float3 src = lightOrigin;
+
+    float3 delta = make_float3(src.x - samplePos.x, src.y - samplePos.y,
+                               src.z - samplePos.z);
+    float dist2 = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+
+    if (dist2 < 1e-10f)
+      continue;
+
+    float dist = sqrtf(dist2);
+    float invDist = 1.0f / dist;
+    delta.x *= invDist;
+    delta.y *= invDist;
+    delta.z *= invDist;
+
+    // ---------------------------------------------------------------
+    // Compute dot product for flat normal: N · delta
+    // ---------------------------------------------------------------
+    float dot = sampleNormal.x * delta.x + sampleNormal.y * delta.y +
+                sampleNormal.z * delta.z;
+    dot = fmaxf(dot, 0.0f);
+
+    // ---------------------------------------------------------------
+    // Hard falloff: zero contribution if past endFadeDistance
+    // ---------------------------------------------------------------
+    bool hasHardFalloff = (light.endFadeDistance > light.startFadeDistance);
+    if (hasHardFalloff) {
+      if (dist > light.endFadeDistance)
+        continue;
+    }
+
+    // Clamp distance for falloff evaluation (CPU: max(1, min(dist, capDist)))
+    float falloffEvalDist = fmaxf(dist, 1.0f);
+    falloffEvalDist = fminf(falloffEvalDist, light.capDist);
+
+    // ---------------------------------------------------------------
+    // Compute falloff based on light type (matches CPU SSE exactly)
+    // ---------------------------------------------------------------
+    float falloff = 0.0f;
+    float3 shadowOrigin = src;
+
+    switch (light.type) {
+    case EMIT_POINT: {
+      // falloff = 1 / (constant + linear*d + quadratic*d²)
+      float denom = light.constant_attn + light.linear_attn * falloffEvalDist +
+                    light.quadratic_attn * falloffEvalDist * falloffEvalDist;
+      falloff = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+      break;
+    }
+
+    case EMIT_SURFACE: {
+      // dot2 = -delta · lightNormal (how much light faces sample)
+      float3 lightNormal =
+          make_float3(light.normal_x, light.normal_y, light.normal_z);
+      float dot2 = -(delta.x * lightNormal.x + delta.y * lightNormal.y +
+                     delta.z * lightNormal.z);
+      dot2 = fmaxf(dot2, 0.0f);
+
+      if (dot <= 0.0f || dot2 <= 0.0f) {
+        falloff = 0.0f;
+        break;
+      }
+
+      // falloff = dot2 / dist²
+      falloff = (dist2 > 0.0f) ? (dot2 / dist2) : 0.0f;
+
+      // CPU offsets shadow origin along light normal by DIST_EPSILON
+      shadowOrigin.x += lightNormal.x * GPU_DIST_EPSILON;
+      shadowOrigin.y += lightNormal.y * GPU_DIST_EPSILON;
+      shadowOrigin.z += lightNormal.z * GPU_DIST_EPSILON;
+      break;
+    }
+
+    case EMIT_SPOTLIGHT: {
+      float3 lightNormal =
+          make_float3(light.normal_x, light.normal_y, light.normal_z);
+      float dot2 = -(delta.x * lightNormal.x + delta.y * lightNormal.y +
+                     delta.z * lightNormal.z);
+
+      // Outside outer cone entirely? Skip
+      if (dot2 <= light.stopdot2) {
+        falloff = 0.0f;
+        break;
+      }
+
+      // Zero dot if outside cone (CPU: dot = AndSIMD(inCone, dot))
+      if (dot2 <= light.stopdot2)
+        dot = 0.0f;
+
+      // Point-light-style attenuation
+      float denom = light.constant_attn + light.linear_attn * falloffEvalDist +
+                    light.quadratic_attn * falloffEvalDist * falloffEvalDist;
+      falloff = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+      falloff *= dot2;
+
+      // Fringe interpolation: between stopdot (inner) and stopdot2 (outer)
+      if (dot2 <= light.stopdot) {
+        float range = light.stopdot - light.stopdot2;
+        float mult = (range > 0.0f) ? ((dot2 - light.stopdot2) / range) : 0.0f;
+        mult = fminf(fmaxf(mult, 0.0f), 1.0f);
+
+        // Apply exponent (CPU uses PowSIMD which is fixed-point)
+        if (light.exponent != 0.0f && light.exponent != 1.0f) {
+          mult = powf(mult, light.exponent);
+        }
+        falloff *= mult;
+      }
+      break;
+    }
+
+    default:
+      continue;
+    } // switch
+
+    // ---------------------------------------------------------------
+    // Hard falloff fade: quintic smoothstep
+    // ---------------------------------------------------------------
+    if (hasHardFalloff) {
+      float range = light.endFadeDistance - light.startFadeDistance;
+      float t =
+          (range > 0.0f) ? ((dist - light.startFadeDistance) / range) : 0.0f;
+      t = fminf(fmaxf(t, 0.0f), 1.0f);
+      t = 1.0f - t;
+      float fade = t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+      falloff *= fade;
+    }
+
+    // Quick check: if falloff * flat-normal dot is zero, skip entirely
+    float contribution = falloff * dot;
+    if (contribution <= 0.0f)
+      continue;
+
+    // ---------------------------------------------------------------
+    // Shadow ray: trace from sample toward light
+    // ---------------------------------------------------------------
+    float3 shadowDir =
+        make_float3(shadowOrigin.x - samplePos.x, shadowOrigin.y - samplePos.y,
+                    shadowOrigin.z - samplePos.z);
+    float shadowDist =
+        sqrtf(shadowDir.x * shadowDir.x + shadowDir.y * shadowDir.y +
+              shadowDir.z * shadowDir.z);
+
+    if (shadowDist < 1e-6f)
+      continue;
+
+    float invShadowDist = 1.0f / shadowDist;
+    shadowDir.x *= invShadowDist;
+    shadowDir.y *= invShadowDist;
+    shadowDir.z *= invShadowDist;
+
+    float visibility = TraceShadowRay(samplePos, shadowDir, shadowDist);
+
+    if (visibility <= 0.0f)
+      continue;
+
+    // ---------------------------------------------------------------
+    // Accumulate per bump vector: falloff * dot[n] * visibility * intensity
+    // dot[0] is the flat normal (already computed); dot[1..3] are bump basis
+    // ---------------------------------------------------------------
+    float scale0 = falloff * dot * visibility;
+    accumR[0] += scale0 * light.intensity_x;
+    accumG[0] += scale0 * light.intensity_y;
+    accumB[0] += scale0 * light.intensity_z;
+
+    // Compute per-bump-vector contributions (only for bumpmapped faces)
+    for (int n = 1; n < normalCount; n++) {
+      float bDot = bumpNormals[n].x * delta.x + bumpNormals[n].y * delta.y +
+                   bumpNormals[n].z * delta.z;
+      bDot = fmaxf(bDot, 0.0f);
+      float bScale = falloff * bDot * visibility;
+      accumR[n] += bScale * light.intensity_x;
+      accumG[n] += bScale * light.intensity_y;
+      accumB[n] += bScale * light.intensity_z;
+    }
+
+  } // for each light
+
+  // ---------------------------------------------------------------
+  // Write results via atomicAdd
+  // ---------------------------------------------------------------
+  for (int n = 0; n < normalCount; n++) {
+    if (accumR[n] > 0.0f || accumG[n] > 0.0f || accumB[n] > 0.0f) {
+      atomicAdd(&params.d_lightOutput[sampleIdx].r[n], accumR[n]);
+      atomicAdd(&params.d_lightOutput[sampleIdx].g[n], accumG[n]);
+      atomicAdd(&params.d_lightOutput[sampleIdx].b[n], accumB[n]);
     }
   }
 }

@@ -2168,36 +2168,40 @@ bool RadWorld_Go() {
     RunThreadsOnIndividual(numfaces, true, BuildFacelights);
     double buildFacelightsTime = Plat_FloatTime() - phaseStart;
 
+    double gpuDirectTime = 0;
 #ifdef VRAD_RTX_CUDA_SUPPORT
     // GPU mega-batching: flush deferred direct lighting shadow rays,
-    // then run 3-phase GPU supersample pipeline.
-    double flushShadowTime = 0, ssCollectTime = 0, ssTraceTime = 0,
-           ssApplyTime = 0;
+    // then run CPU supersampling + patch lights.
+    double flushShadowTime = 0, ssTime = 0;
+    double sceneDataUploadTime = 0;
     if (g_bUseGPU) {
+      // Upload all sample/face/cluster data to VRAM
+      // now that BuildFacelights has populated facelight[].
+      {
+        extern void BuildGPUSceneData();
+        double uploadStart = Plat_FloatTime();
+        BuildGPUSceneData();
+        sceneDataUploadTime = Plat_FloatTime() - uploadStart;
+      }
+
+      // GPU direct lighting kernel:
+      // Computes emit_point/surface/spotlight contributions on GPU with
+      // inline shadow tracing. Results added to facelight[].light[0][].
+      {
+        double dlStart = Plat_FloatTime();
+        LaunchGPUDirectLighting();
+        DownloadAndApplyGPUResults();
+        gpuDirectTime = Plat_FloatTime() - dlStart;
+      }
+
       phaseStart = Plat_FloatTime();
       FlushAllThreadShadowRays();
       flushShadowTime = Plat_FloatTime() - phaseStart;
 
-      InitSupersampleGPUBuffers();
-
-      if (do_extra) {
-        // Phase 1: Collect pass-1 supersample rays (threaded)
-        phaseStart = Plat_FloatTime();
-        RunThreadsOnIndividual(numfaces, false, FinalizeFacelights);
-        ssCollectTime = Plat_FloatTime() - phaseStart;
-
-        // Phase 2: GPU mega-batch trace (serial)
-        phaseStart = Plat_FloatTime();
-        FlushAllThreadSupersampleRays();
-        ssTraceTime = Plat_FloatTime() - phaseStart;
-      }
-
-      // Phase 3: Apply results + CPU fallback passes 2-4 + patches (threaded)
+      // CPU supersampling + patch lights (all gradient passes, all lights)
       phaseStart = Plat_FloatTime();
-      RunThreadsOnIndividual(numfaces, false, ApplySupersampleAndCleanup);
-      ssApplyTime = Plat_FloatTime() - phaseStart;
-
-      ShutdownSupersampleGPUBuffers();
+      RunThreadsOnIndividual(numfaces, false, FinalizeAndSupersample);
+      ssTime = Plat_FloatTime() - phaseStart;
     }
 #endif
 
@@ -2212,24 +2216,21 @@ bool RadWorld_Go() {
             : 0);
 #ifdef VRAD_RTX_CUDA_SUPPORT
     if (g_bUseGPU) {
+      Msg("  SceneData Upload:  %6.2f s  (%4.1f%%)\n", sceneDataUploadTime,
+          g_flDirectLightingTime > 0
+              ? 100.0 * sceneDataUploadTime / g_flDirectLightingTime
+              : 0);
+      Msg("  GPU Direct Light:  %6.2f s  (%4.1f%%)\n", gpuDirectTime,
+          g_flDirectLightingTime > 0
+              ? 100.0 * gpuDirectTime / g_flDirectLightingTime
+              : 0);
       Msg("  FlushShadowRays:   %6.2f s  (%4.1f%%)\n", flushShadowTime,
           g_flDirectLightingTime > 0
               ? 100.0 * flushShadowTime / g_flDirectLightingTime
               : 0);
-      if (do_extra) {
-        Msg("  SS Collect (CPU):  %6.2f s  (%4.1f%%)\n", ssCollectTime,
-            g_flDirectLightingTime > 0
-                ? 100.0 * ssCollectTime / g_flDirectLightingTime
-                : 0);
-        Msg("  SS Trace (GPU):    %6.2f s  (%4.1f%%)\n", ssTraceTime,
-            g_flDirectLightingTime > 0
-                ? 100.0 * ssTraceTime / g_flDirectLightingTime
-                : 0);
-      }
-      Msg("  SS Apply+Cleanup: %6.2f s  (%4.1f%%)\n", ssApplyTime,
-          g_flDirectLightingTime > 0
-              ? 100.0 * ssApplyTime / g_flDirectLightingTime
-              : 0);
+      Msg("  SS + PatchLights:  %6.2f s  (%4.1f%%)\n", ssTime,
+          g_flDirectLightingTime > 0 ? 100.0 * ssTime / g_flDirectLightingTime
+                                     : 0);
     }
 #endif
 

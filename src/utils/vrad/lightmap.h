@@ -87,6 +87,12 @@ extern directlight_t *freelights;
 extern facelight_t facelight[MAX_MAP_FACES];
 extern int numdlights;
 
+// Per-cluster light list globals (defined in lightmap.cpp)
+extern directlight_t **g_ClusterLightFlat;
+extern int *g_ClusterLightOffsets;
+extern int *g_nClusterLights;
+extern int g_nTotalClusterLightEntries;
+
 //==============================================
 
 struct lightinfo_t {
@@ -148,11 +154,11 @@ extern long g_nSSGradientTotal[MAX_TOOL_THREADS];
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
 void FlushAllThreadShadowRays();
-void FinalizeFacelights(int iThread, int facenum);
-void InitSupersampleGPUBuffers();
-void ShutdownSupersampleGPUBuffers();
-void FlushAllThreadSupersampleRays();
-void ApplySupersampleAndCleanup(int iThread, int facenum);
+void FinalizeAndSupersample(int iThread, int facenum);
+void BuildGPUSceneData();
+void ShutdownGPUSceneDataBridge();
+void LaunchGPUDirectLighting();
+void DownloadAndApplyGPUResults();
 #endif
 
 #endif // LIGHTMAP_H

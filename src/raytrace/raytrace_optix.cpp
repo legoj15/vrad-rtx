@@ -3,6 +3,7 @@
 //========================================================================
 
 #include "raytrace_optix.h"
+#include "direct_lighting_gpu.h"
 #include "raytrace.h"
 #include "tier0/dbg.h"
 #include "tier1/strtools.h"
@@ -104,6 +105,7 @@ void *RayTraceOptiX::s_d_visiblePairs = nullptr;
 void *RayTraceOptiX::s_d_pairCount = nullptr;
 int RayTraceOptiX::s_maxVisibilityPairs = 0;
 void *RayTraceOptiX::s_visRaygenPG = nullptr;
+void *RayTraceOptiX::s_directLightingRaygenPG = nullptr;
 
 CThreadMutex RayTraceOptiX::s_Mutex;
 
@@ -149,6 +151,17 @@ struct OptixLaunchParams {
   VisiblePair *visible_pairs;
   int *pair_count_atomic;
   int max_pairs;
+
+  // Direct Lighting Extension (Phase 2) — must match optix_kernels.cu
+  const GPUSampleData *d_samples;
+  const GPULight *d_lights;
+  const GPUClusterLightList *d_clusterLists;
+  const int *d_clusterLightIndices;
+  const GPUFaceInfo *d_faceInfos;
+  GPULightOutput *d_lightOutput;
+  int num_samples;
+  int num_lights;
+  int num_clusters;
 };
 
 // Embedded PTX (will be set during build or loaded from file)
@@ -305,6 +318,17 @@ bool RayTraceOptiX::Initialize() {
       (OptixDeviceContext)s_context, &visRaygenDesc, 1, &pgOptions, log,
       &logSize, (OptixProgramGroup *)&s_visRaygenPG));
 
+  // Direct Lighting Ray Generation (Phase 2)
+  OptixProgramGroupDesc dlRaygenDesc = {};
+  dlRaygenDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+  dlRaygenDesc.raygen.module = (OptixModule)s_module;
+  dlRaygenDesc.raygen.entryFunctionName = "__raygen__direct_lighting";
+
+  logSize = sizeof(log);
+  OPTIX_CHECK(optixProgramGroupCreate(
+      (OptixDeviceContext)s_context, &dlRaygenDesc, 1, &pgOptions, log,
+      &logSize, (OptixProgramGroup *)&s_directLightingRaygenPG));
+
   // Miss program
   OptixProgramGroupDesc missDesc = {};
   missDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
@@ -329,10 +353,11 @@ bool RayTraceOptiX::Initialize() {
       (OptixDeviceContext)s_context, &hitgroupDesc, 1, &pgOptions, log,
       &logSize, (OptixProgramGroup *)&s_hitgroupPG));
 
-  // Create pipeline
+  // Create pipeline — 5 program groups now (added directLightingRaygen)
   OptixProgramGroup programGroups[] = {
       (OptixProgramGroup)s_raygenPG, (OptixProgramGroup)s_missPG,
-      (OptixProgramGroup)s_hitgroupPG, (OptixProgramGroup)s_visRaygenPG};
+      (OptixProgramGroup)s_hitgroupPG, (OptixProgramGroup)s_visRaygenPG,
+      (OptixProgramGroup)s_directLightingRaygenPG};
 
   OptixPipelineLinkOptions linkOptions = {};
   linkOptions.maxTraceDepth = 1;
@@ -340,7 +365,7 @@ bool RayTraceOptiX::Initialize() {
   logSize = sizeof(log);
   OPTIX_CHECK(optixPipelineCreate(
       (OptixDeviceContext)s_context, &pipelineOptions, &linkOptions,
-      programGroups, 4, log, &logSize, (OptixPipeline *)&s_pipeline));
+      programGroups, 5, log, &logSize, (OptixPipeline *)&s_pipeline));
 
   if (logSize > 1)
     Msg("OptiX Pipeline Log: %s\n", log);
@@ -463,6 +488,8 @@ void RayTraceOptiX::Shutdown() {
     optixProgramGroupDestroy((OptixProgramGroup)s_raygenPG);
   if (s_visRaygenPG)
     optixProgramGroupDestroy((OptixProgramGroup)s_visRaygenPG);
+  if (s_directLightingRaygenPG)
+    optixProgramGroupDestroy((OptixProgramGroup)s_directLightingRaygenPG);
   if (s_missPG)
     optixProgramGroupDestroy((OptixProgramGroup)s_missPG);
   if (s_hitgroupPG)
@@ -622,10 +649,11 @@ void RayTraceOptiX::BuildScene(
                                             &hitgroupRecord));
 
   // Allocate SBT on device
-  size_t sbtSize = sizeof(SbtRecord) * 4; // Added one record
+  size_t sbtSize =
+      sizeof(SbtRecord) * 5; // raygen, miss, hitgroup, visRaygen, dlRaygen
   CUDA_CHECK_VOID(cudaMalloc(&s_d_sbt_buffer, sbtSize));
 
-  SbtRecord *h_sbt = new SbtRecord[4];
+  SbtRecord *h_sbt = new SbtRecord[5];
   h_sbt[0] = raygenRecord;
   h_sbt[1] = missRecord;
   h_sbt[2] = hitgroupRecord;
@@ -635,6 +663,12 @@ void RayTraceOptiX::BuildScene(
   OPTIX_CHECK_VOID(optixSbtRecordPackHeader((OptixProgramGroup)s_visRaygenPG,
                                             &visRaygenRecord));
   h_sbt[3] = visRaygenRecord;
+
+  // Pack direct lighting raygen header (Phase 2)
+  SbtRecord dlRaygenRecord;
+  OPTIX_CHECK_VOID(optixSbtRecordPackHeader(
+      (OptixProgramGroup)s_directLightingRaygenPG, &dlRaygenRecord));
+  h_sbt[4] = dlRaygenRecord;
 
   CUDA_CHECK_VOID(
       cudaMemcpy(s_d_sbt_buffer, h_sbt, sbtSize, cudaMemcpyHostToDevice));
@@ -865,6 +899,67 @@ void RayTraceOptiX::TraceClusterVisibility(
   } else {
     visiblePairs.RemoveAll();
   }
+}
+
+//-----------------------------------------------------------------------------
+// TraceDirectLighting — Phase 2 kernel launch
+// 1D launch: one thread per lightmap sample
+//-----------------------------------------------------------------------------
+void RayTraceOptiX::TraceDirectLighting(int numSamples) {
+  if (!s_bInitialized || numSamples <= 0)
+    return;
+
+  AUTO_LOCK(s_Mutex);
+
+  // Build launch params with all Phase 1 device pointers
+  OptixLaunchParams params = {};
+  params.traversable = s_gas_handle;
+  params.triangles = s_d_triangles;
+
+  // Direct lighting data
+  params.d_samples = GetDeviceSamples();
+  params.d_lights = GetGPULights();
+  params.d_clusterLists = GetDeviceClusterLightLists();
+  params.d_clusterLightIndices = GetDeviceClusterLightIndices();
+  params.d_faceInfos = GetDeviceFaceInfos();
+  params.d_lightOutput = GetDeviceDirectLightingOutput();
+  params.num_samples = numSamples;
+  params.num_lights = GetGPULightCount();
+
+  // num_clusters: we need to pass the cluster count so the kernel can
+  // bounds-check. We stored it during upload — query from the data.
+  // For now, pass a safe upper bound. The kernel only accesses
+  // clusterLists[sample.clusterIndex], so bounds checking uses this.
+  // We'll use the count from the uploaded scene data.
+  extern int GetGPUClusterCount(); // forward decl
+  params.num_clusters = GetGPUClusterCount();
+
+  // Upload params to device
+  CUDA_CHECK_VOID(cudaMemcpy(s_d_launchParams[0], &params,
+                             sizeof(OptixLaunchParams),
+                             cudaMemcpyHostToDevice));
+
+  // Build SBT pointing to direct lighting raygen (index 4)
+  OptixShaderBindingTable sbt = {};
+  sbt.raygenRecord =
+      (CUdeviceptr)s_d_sbt_buffer + 4 * OPTIX_SBT_RECORD_HEADER_SIZE;
+  sbt.missRecordBase =
+      (CUdeviceptr)s_d_sbt_buffer + OPTIX_SBT_RECORD_HEADER_SIZE;
+  sbt.missRecordStrideInBytes = OPTIX_SBT_RECORD_HEADER_SIZE;
+  sbt.missRecordCount = 1;
+  sbt.hitgroupRecordBase =
+      (CUdeviceptr)s_d_sbt_buffer + 2 * OPTIX_SBT_RECORD_HEADER_SIZE;
+  sbt.hitgroupRecordStrideInBytes = OPTIX_SBT_RECORD_HEADER_SIZE;
+  sbt.hitgroupRecordCount = 1;
+
+  // Launch: 1D, one thread per sample
+  cudaStream_t stream = (cudaStream_t)s_streams[0];
+  OPTIX_CHECK_VOID(optixLaunch(
+      (OptixPipeline)s_pipeline, stream, (CUdeviceptr)s_d_launchParams[0],
+      sizeof(OptixLaunchParams), &sbt, numSamples, 1, 1));
+
+  // Synchronize — results needed immediately
+  CUDA_CHECK_VOID(cudaStreamSynchronize(stream));
 }
 
 // CUDA kernel launcher declarations (defined in raytrace_cuda.cu)

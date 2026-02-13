@@ -11,6 +11,14 @@
 #ifdef VRAD_RTX_CUDA_SUPPORT
 
 #include "direct_lighting_gpu.h"
+#include "lightmap.h"
+#include "mathlib/bumpvects.h"
+#include "raytrace_optix.h"
+
+// Overload in lightmap.cpp that accepts float* texture vectors
+extern void GetBumpNormals(const float *sVect, const float *tVect,
+                           const Vector &flatNormal, const Vector &phongNormal,
+                           Vector bumpNormals[NUM_BUMP_VECTS]);
 
 //-----------------------------------------------------------------------------
 // Convert directlight_t to GPULight
@@ -18,17 +26,17 @@
 static GPULight ConvertDirectLight(const directlight_t *dl) {
   GPULight gpu;
 
-  gpu.origin.x = dl->light.origin.x;
-  gpu.origin.y = dl->light.origin.y;
-  gpu.origin.z = dl->light.origin.z;
+  gpu.origin_x = dl->light.origin.x;
+  gpu.origin_y = dl->light.origin.y;
+  gpu.origin_z = dl->light.origin.z;
 
-  gpu.intensity.x = dl->light.intensity.x;
-  gpu.intensity.y = dl->light.intensity.y;
-  gpu.intensity.z = dl->light.intensity.z;
+  gpu.intensity_x = dl->light.intensity.x;
+  gpu.intensity_y = dl->light.intensity.y;
+  gpu.intensity_z = dl->light.intensity.z;
 
-  gpu.normal.x = dl->light.normal.x;
-  gpu.normal.y = dl->light.normal.y;
-  gpu.normal.z = dl->light.normal.z;
+  gpu.normal_x = dl->light.normal.x;
+  gpu.normal_y = dl->light.normal.y;
+  gpu.normal_z = dl->light.normal.z;
 
   gpu.type = dl->light.type;
   gpu.facenum = dl->facenum;
@@ -183,6 +191,282 @@ void FlushShadowBatch(int iThread, GPUShadowResult *results) {
 
   TraceShadowBatch(batch->rays, results, batch->numRays);
   batch->Clear();
+}
+
+//=============================================================================
+// BuildGPUSceneData — Phase 1 bridge
+//
+// After BuildFacelights completes (samples exist for all faces), this function
+// packs sample positions/normals + face metadata + cluster-light lists into
+// contiguous GPU-friendly arrays and uploads them to VRAM.
+//=============================================================================
+
+// Forward decl for ClusterFromPoint (declared in vrad.h, included above)
+// int ClusterFromPoint(Vector const &point);
+
+void BuildGPUSceneData() {
+  // --- Pass 1: count total samples across all faces ---
+  int totalSamples = 0;
+  for (int f = 0; f < numfaces; f++) {
+    totalSamples += facelight[f].numsamples;
+  }
+
+  if (totalSamples == 0) {
+    Msg("BuildGPUSceneData: No samples to upload.\n");
+    return;
+  }
+
+  Msg("BuildGPUSceneData: Packing %d samples across %d faces...\n",
+      totalSamples, numfaces);
+
+  // --- Allocate host buffers ---
+  GPUSampleData *hostSamples = new GPUSampleData[totalSamples];
+  GPUFaceInfo *hostFaceInfos = new GPUFaceInfo[numfaces];
+
+  // --- Pass 2: fill sample + face info arrays ---
+  int sampleCursor = 0;
+  for (int f = 0; f < numfaces; f++) {
+    facelight_t *fl = &facelight[f];
+    hostFaceInfos[f].sampleOffset = sampleCursor;
+    hostFaceInfos[f].sampleCount = fl->numsamples;
+    bool hasBump = (texinfo[g_pFaces[f].texinfo].flags & SURF_BUMPLIGHT) != 0;
+    hostFaceInfos[f].needsBumpmap = hasBump ? 1 : 0;
+
+    if (hasBump) {
+      hostFaceInfos[f].normalCount = NUM_BUMP_VECTS + 1; // 4: flat + 3 bump
+
+      // Compute world-space bump basis from face texture vectors
+      // NOTE: CPU (lightmap.cpp:4039) uses the raw plane normal without
+      // side flipping for GetBumpNormals — must match exactly.
+      texinfo_t *pTexInfo = &texinfo[g_pFaces[f].texinfo];
+      Vector flatNormal;
+      VectorCopy(dplanes[g_pFaces[f].planenum].normal, flatNormal);
+
+      Vector bumpVects[NUM_BUMP_VECTS];
+      GetBumpNormals(pTexInfo->textureVecsTexelsPerWorldUnits[0],
+                     pTexInfo->textureVecsTexelsPerWorldUnits[1], flatNormal,
+                     flatNormal, bumpVects);
+
+      hostFaceInfos[f].bumpNormal0_x = bumpVects[0].x;
+      hostFaceInfos[f].bumpNormal0_y = bumpVects[0].y;
+      hostFaceInfos[f].bumpNormal0_z = bumpVects[0].z;
+      hostFaceInfos[f].bumpNormal1_x = bumpVects[1].x;
+      hostFaceInfos[f].bumpNormal1_y = bumpVects[1].y;
+      hostFaceInfos[f].bumpNormal1_z = bumpVects[1].z;
+      hostFaceInfos[f].bumpNormal2_x = bumpVects[2].x;
+      hostFaceInfos[f].bumpNormal2_y = bumpVects[2].y;
+      hostFaceInfos[f].bumpNormal2_z = bumpVects[2].z;
+    } else {
+      hostFaceInfos[f].normalCount = 1;
+      hostFaceInfos[f].bumpNormal0_x = 0;
+      hostFaceInfos[f].bumpNormal0_y = 0;
+      hostFaceInfos[f].bumpNormal0_z = 0;
+      hostFaceInfos[f].bumpNormal1_x = 0;
+      hostFaceInfos[f].bumpNormal1_y = 0;
+      hostFaceInfos[f].bumpNormal1_z = 0;
+      hostFaceInfos[f].bumpNormal2_x = 0;
+      hostFaceInfos[f].bumpNormal2_y = 0;
+      hostFaceInfos[f].bumpNormal2_z = 0;
+    }
+
+    for (int s = 0; s < fl->numsamples; s++) {
+      sample_t &sample = fl->sample[s];
+      GPUSampleData &gpu = hostSamples[sampleCursor];
+
+      gpu.position.x = sample.pos.x;
+      gpu.position.y = sample.pos.y;
+      gpu.position.z = sample.pos.z;
+      gpu.normal.x = sample.normal.x;
+      gpu.normal.y = sample.normal.y;
+      gpu.normal.z = sample.normal.z;
+      gpu.faceIndex = f;
+      gpu.sampleIndex = s;
+      gpu.clusterIndex = ClusterFromPoint(sample.pos);
+      gpu.pad0 = 0;
+
+      sampleCursor++;
+    }
+  }
+
+  // --- Build cluster-light index arrays ---
+  // Convert from directlight_t* pointers to integer indices matching
+  // the GPULight array order (sequential iteration of activelights).
+  int numClusters = dvis->numclusters;
+
+  // Build a pointer → index lookup for active lights.
+  // The GPULight array is built by iterating activelights in order,
+  // so lightPtrs[i] corresponds to GPULight index i.
+  CUtlVector<directlight_t *> lightPtrs;
+  for (directlight_t *dl = activelights; dl != nullptr; dl = dl->next) {
+    lightPtrs.AddToTail(dl);
+  }
+  int numLightsTotal = lightPtrs.Count();
+
+  GPUClusterLightList *hostClusterLists = nullptr;
+  int *hostClusterLightIndices = nullptr;
+  int numClusterLightEntries = 0;
+
+  if (numClusters > 0 && g_nClusterLights && g_ClusterLightOffsets) {
+    hostClusterLists = new GPUClusterLightList[numClusters];
+
+    // Count total entries
+    numClusterLightEntries = g_nTotalClusterLightEntries;
+    hostClusterLightIndices = new int[numClusterLightEntries];
+
+    // Walk the existing CSR-style per-cluster light arrays, converting
+    // directlight_t* pointers to integer indices.
+    extern directlight_t **g_ClusterLightFlat;
+    extern int *g_ClusterLightOffsets;
+    int cursor = 0;
+    for (int c = 0; c < numClusters; c++) {
+      hostClusterLists[c].lightOffset = cursor;
+      hostClusterLists[c].lightCount = g_nClusterLights[c];
+
+      int offset = g_ClusterLightOffsets[c];
+      for (int i = 0; i < g_nClusterLights[c]; i++) {
+        directlight_t *dl = g_ClusterLightFlat[offset + i];
+        // Linear scan to find the index — typically <1000 lights
+        int lightIdx = -1;
+        for (int k = 0; k < numLightsTotal; k++) {
+          if (lightPtrs[k] == dl) {
+            lightIdx = k;
+            break;
+          }
+        }
+        hostClusterLightIndices[cursor] = lightIdx;
+        cursor++;
+      }
+    }
+  }
+
+  // --- Upload to VRAM ---
+  UploadGPUSceneData(hostSamples, totalSamples, hostFaceInfos, numfaces,
+                     hostClusterLists, numClusters, hostClusterLightIndices,
+                     numClusterLightEntries);
+
+  Msg("BuildGPUSceneData: %d lights indexed, %d clusters, %d cluster-light "
+      "entries\n",
+      numLightsTotal, numClusters, numClusterLightEntries);
+
+  // --- Cleanup host buffers ---
+  delete[] hostSamples;
+  delete[] hostFaceInfos;
+  delete[] hostClusterLists;
+  delete[] hostClusterLightIndices;
+}
+
+void ShutdownGPUSceneDataBridge() {
+  ShutdownGPUSceneData();
+  ShutdownDirectLightingGPU();
+}
+
+//=============================================================================
+// Phase 2: Launch GPU direct lighting kernel and apply results
+//=============================================================================
+
+void LaunchGPUDirectLighting() {
+  int numSamples = GetGPUSampleCount();
+  if (numSamples <= 0) {
+    Warning("LaunchGPUDirectLighting: No samples uploaded!\n");
+    return;
+  }
+
+  // Allocate and zero the output buffer
+  AllocateDirectLightingOutput(numSamples);
+
+  Msg("LaunchGPUDirectLighting: Launching kernel for %d samples...\n",
+      numSamples);
+
+  double startTime = Plat_FloatTime();
+
+  // Launch the OptiX __raygen__direct_lighting kernel
+  RayTraceOptiX::TraceDirectLighting(numSamples);
+
+  double elapsed = Plat_FloatTime() - startTime;
+  Msg("LaunchGPUDirectLighting: Kernel completed in %.3f seconds\n", elapsed);
+}
+
+void DownloadAndApplyGPUResults() {
+  int numSamples = GetGPUSampleCount();
+  int numFaces = GetGPUFaceInfoCount();
+  if (numSamples <= 0 || numFaces <= 0) {
+    Warning("DownloadAndApplyGPUResults: No data to download!\n");
+    return;
+  }
+
+  // Download the GPU output buffer to host
+  GPULightOutput *hostOutput = new GPULightOutput[numSamples];
+  DownloadDirectLightingOutput(hostOutput, numSamples);
+
+  // We also need the face info array to know which samples belong to which face
+  // Re-iterate the same facelight structure used during upload
+  int applied = 0;
+  int sampleCursor = 0;
+
+  // Diagnostic accumulators
+  double totalR = 0, totalG = 0, totalB = 0, totalSun = 0;
+  int zeroSamples = 0, nonzeroSamples = 0;
+  float maxR = 0, maxG = 0, maxB = 0;
+
+  for (int facenum = 0; facenum < numfaces; facenum++) {
+    facelight_t &fl = facelight[facenum];
+    if (fl.numsamples <= 0) {
+      continue;
+    }
+
+    for (int s = 0; s < fl.numsamples; s++) {
+      if (sampleCursor >= numSamples)
+        break;
+
+      const GPULightOutput &out = hostOutput[sampleCursor];
+
+      // Diagnostic tracking (channel [0] = flat normal)
+      totalR += out.r[0];
+      totalG += out.g[0];
+      totalB += out.b[0];
+      totalSun += out.sunAmount;
+      if (out.r[0] > maxR)
+        maxR = out.r[0];
+      if (out.g[0] > maxG)
+        maxG = out.g[0];
+      if (out.b[0] > maxB)
+        maxB = out.b[0];
+      if (out.r[0] == 0.0f && out.g[0] == 0.0f && out.b[0] == 0.0f)
+        zeroSamples++;
+      else
+        nonzeroSamples++;
+
+      // Apply per-bump-vector GPU results to lightstyle 0.
+      // The GPU kernel computed separate dot products for each bump normal,
+      // matching the CPU's GatherSampleStandardLightSSE behavior.
+      int normalCount =
+          (texinfo[g_pFaces[facenum].texinfo].flags & SURF_BUMPLIGHT)
+              ? NUM_BUMP_VECTS + 1
+              : 1;
+      for (int n = 0; n < normalCount; n++) {
+        if (fl.light[0][n]) {
+          fl.light[0][n][s].m_vecLighting.x += out.r[n];
+          fl.light[0][n][s].m_vecLighting.y += out.g[n];
+          fl.light[0][n][s].m_vecLighting.z += out.b[n];
+        }
+      }
+      applied++;
+
+      sampleCursor++;
+    }
+  }
+
+  Msg("DownloadAndApplyGPUResults: Applied %d sample results across %d faces\n",
+      applied, numFaces);
+  Msg("  GPU Output Diagnostics:\n");
+  Msg("    Total energy: R=%.1f G=%.1f B=%.1f\n", totalR, totalG, totalB);
+  Msg("    Nonzero samples: %d (%.1f%%)\n", nonzeroSamples,
+      numSamples > 0 ? 100.0 * nonzeroSamples / numSamples : 0.0);
+  Msg("    Zero samples: %d (%.1f%%)\n", zeroSamples,
+      numSamples > 0 ? 100.0 * zeroSamples / numSamples : 0.0);
+  Msg("    Max sample: R=%.3f G=%.3f B=%.3f\n", maxR, maxG, maxB);
+
+  delete[] hostOutput;
 }
 
 #endif // VRAD_RTX_CUDA_SUPPORT

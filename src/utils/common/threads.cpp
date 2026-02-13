@@ -20,7 +20,6 @@
 #include "pacifier.h"
 #include "threads.h"
 
-
 #define MAX_THREADS MAX_TOOL_THREADS
 
 class CRunThreadsData {
@@ -215,6 +214,6 @@ void RunThreadsOn(int workcnt, qboolean showpacifier, RunThreadsFn fn,
   end = Plat_FloatTime();
   if (pacifier) {
     EndPacifier(false);
-    printf(" (%i)\n", end - start);
+    Msg(" (%i seconds)\n", end - start);
   }
 }

@@ -9,13 +9,17 @@
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
 
+#include "gpu_scene_data.h"
 #include "raytrace_shared.h"
 
 // GPU-friendly light structure matching directlight_t
+// NOTE: Uses explicit float fields instead of float3_t to guarantee identical
+// struct layout between MSVC (host) and NVCC (device PTX) compilation.
+// float3_t (typedef float3 on NVCC) can introduce padding differences.
 struct GPULight {
-  float3_t origin;
-  float3_t intensity;
-  float3_t normal; // For emit_surface and emit_spotlight
+  float origin_x, origin_y, origin_z;
+  float intensity_x, intensity_y, intensity_z;
+  float normal_x, normal_y, normal_z; // For emit_surface and emit_spotlight
 
   int type; // emit_point=0, emit_surface=1, emit_spotlight=2, emit_skylight=3
   int facenum; // -1 for point lights, face index for surface lights

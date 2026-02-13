@@ -13,7 +13,6 @@
 #include <cuda_runtime.h>
 #include <vector>
 
-
 // Static storage for GPU lights
 static std::vector<GPULight> s_hostLights;
 static GPULight *s_deviceLights = nullptr;
@@ -126,5 +125,169 @@ const GPULight *GetHostLight(int index) {
   }
   return nullptr;
 }
+
+//=============================================================================
+// GPU Scene Data Upload (Phase 1 infrastructure)
+//=============================================================================
+
+static GPUSampleData *s_deviceSamples = nullptr;
+static GPUFaceInfo *s_deviceFaceInfos = nullptr;
+static GPUClusterLightList *s_deviceClusterLists = nullptr;
+static int *s_deviceClusterLightIndices = nullptr;
+static int s_numSamples = 0;
+static int s_numFaceInfos = 0;
+static int s_numClusterLists = 0;
+static int s_numClusterLightEntries = 0;
+static bool s_sceneDataUploaded = false;
+
+static GPULightOutput *s_deviceLightOutput = nullptr;
+static int s_lightOutputCount = 0;
+
+// Helper: allocate + upload a typed array to VRAM.
+// Returns device pointer on success, nullptr on failure.
+template <typename T>
+static T *CudaUpload(const T *hostData, int count, const char *label) {
+  if (count <= 0 || !hostData)
+    return nullptr;
+
+  T *devicePtr = nullptr;
+  size_t bytes = (size_t)count * sizeof(T);
+  cudaError_t err = cudaMalloc(&devicePtr, bytes);
+  if (err != cudaSuccess) {
+    printf("UploadGPUSceneData: cudaMalloc(%s, %.2f MB) failed: %s\n", label,
+           bytes / (1024.0 * 1024.0), cudaGetErrorString(err));
+    return nullptr;
+  }
+
+  err = cudaMemcpy(devicePtr, hostData, bytes, cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    printf("UploadGPUSceneData: cudaMemcpy(%s) failed: %s\n", label,
+           cudaGetErrorString(err));
+    cudaFree(devicePtr);
+    return nullptr;
+  }
+
+  printf("  %-28s %10d items  %8.2f MB\n", label, count,
+         bytes / (1024.0 * 1024.0));
+  return devicePtr;
+}
+
+void UploadGPUSceneData(const GPUSampleData *samples, int numSamples,
+                        const GPUFaceInfo *faceInfos, int numFaces,
+                        const GPUClusterLightList *clusterLists,
+                        int numClusters, const int *clusterLightIndices,
+                        int numClusterLightEntries) {
+  if (s_sceneDataUploaded) {
+    ShutdownGPUSceneData();
+  }
+
+  printf("UploadGPUSceneData: Uploading to VRAM...\n");
+
+  s_deviceSamples = CudaUpload(samples, numSamples, "GPUSampleData");
+  s_deviceFaceInfos = CudaUpload(faceInfos, numFaces, "GPUFaceInfo");
+  s_deviceClusterLists =
+      CudaUpload(clusterLists, numClusters, "GPUClusterLightList");
+  s_deviceClusterLightIndices = CudaUpload(
+      clusterLightIndices, numClusterLightEntries, "ClusterLightIdx");
+
+  s_numSamples = numSamples;
+  s_numFaceInfos = numFaces;
+  s_numClusterLists = numClusters;
+  s_numClusterLightEntries = numClusterLightEntries;
+
+  // Compute total VRAM used by scene data
+  size_t totalBytes = (size_t)numSamples * sizeof(GPUSampleData) +
+                      (size_t)numFaces * sizeof(GPUFaceInfo) +
+                      (size_t)numClusters * sizeof(GPUClusterLightList) +
+                      (size_t)numClusterLightEntries * sizeof(int);
+
+  printf("UploadGPUSceneData: Total VRAM for scene data: %.2f MB\n",
+         totalBytes / (1024.0 * 1024.0));
+  printf("  %d samples, %d faces, %d clusters, %d cluster-light entries\n",
+         numSamples, numFaces, numClusters, numClusterLightEntries);
+
+  s_sceneDataUploaded = true;
+}
+
+void AllocateDirectLightingOutput(int numSamples) {
+  if (s_deviceLightOutput) {
+    cudaFree(s_deviceLightOutput);
+    s_deviceLightOutput = nullptr;
+  }
+
+  s_lightOutputCount = numSamples;
+  size_t bytes = (size_t)numSamples * sizeof(GPULightOutput);
+  cudaError_t err = cudaMalloc(&s_deviceLightOutput, bytes);
+  if (err != cudaSuccess) {
+    printf("AllocateDirectLightingOutput: cudaMalloc(%.2f MB) failed: %s\n",
+           bytes / (1024.0 * 1024.0), cudaGetErrorString(err));
+    s_deviceLightOutput = nullptr;
+    return;
+  }
+
+  // Zero the buffer so atomicAdd starts from 0
+  err = cudaMemset(s_deviceLightOutput, 0, bytes);
+  if (err != cudaSuccess) {
+    printf("AllocateDirectLightingOutput: cudaMemset failed: %s\n",
+           cudaGetErrorString(err));
+  }
+
+  printf("AllocateDirectLightingOutput: %d samples (%.2f MB)\n", numSamples,
+         bytes / (1024.0 * 1024.0));
+}
+
+void DownloadDirectLightingOutput(GPULightOutput *hostBuffer, int numSamples) {
+  if (!s_deviceLightOutput || numSamples <= 0)
+    return;
+
+  size_t bytes = (size_t)numSamples * sizeof(GPULightOutput);
+  cudaError_t err = cudaMemcpy(hostBuffer, s_deviceLightOutput, bytes,
+                               cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    printf("DownloadDirectLightingOutput: cudaMemcpy failed: %s\n",
+           cudaGetErrorString(err));
+  }
+}
+
+void ShutdownGPUSceneData() {
+  if (s_deviceSamples) {
+    cudaFree(s_deviceSamples);
+    s_deviceSamples = nullptr;
+  }
+  if (s_deviceFaceInfos) {
+    cudaFree(s_deviceFaceInfos);
+    s_deviceFaceInfos = nullptr;
+  }
+  if (s_deviceClusterLists) {
+    cudaFree(s_deviceClusterLists);
+    s_deviceClusterLists = nullptr;
+  }
+  if (s_deviceClusterLightIndices) {
+    cudaFree(s_deviceClusterLightIndices);
+    s_deviceClusterLightIndices = nullptr;
+  }
+  if (s_deviceLightOutput) {
+    cudaFree(s_deviceLightOutput);
+    s_deviceLightOutput = nullptr;
+  }
+  s_numSamples = 0;
+  s_numFaceInfos = 0;
+  s_numClusterLists = 0;
+  s_numClusterLightEntries = 0;
+  s_lightOutputCount = 0;
+  s_sceneDataUploaded = false;
+}
+
+int GetGPUSampleCount() { return s_numSamples; }
+int GetGPUFaceInfoCount() { return s_numFaceInfos; }
+int GetGPUClusterCount() { return s_numClusterLists; }
+
+GPUSampleData *GetDeviceSamples() { return s_deviceSamples; }
+GPUFaceInfo *GetDeviceFaceInfos() { return s_deviceFaceInfos; }
+GPUClusterLightList *GetDeviceClusterLightLists() {
+  return s_deviceClusterLists;
+}
+int *GetDeviceClusterLightIndices() { return s_deviceClusterLightIndices; }
+GPULightOutput *GetDeviceDirectLightingOutput() { return s_deviceLightOutput; }
 
 #endif // VRAD_RTX_CUDA_SUPPORT

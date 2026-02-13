@@ -51,6 +51,7 @@ $Project "Raytrace"
 		$File	"raytrace_optix.h"
 		$File	"raytrace_shared.h"
 		$File	"direct_lighting_gpu.h"
+		$File	"gpu_scene_data.h"
 		$File	"visibility_gpu.h"
 	}
 	
