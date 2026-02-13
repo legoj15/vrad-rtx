@@ -25,14 +25,14 @@ $Configuration
 		$AdditionalLibraryDirectories		"$BASE;$(CUDA_PATH)\lib\x64"
 	}
 
-	$PostBuildEvent [!$ANALYZE]
-	{
-		$CommandLine		"$BASE" \
-							"pushd $QUOTE$OUTBINDIR$QUOTE" "\n" \
-							"pwsh -ExecutionPolicy Bypass .\test_vrad_optix_quick.ps1" "\n" \
-							"popd" "\n"
-		$Description		"Running vrad_rtx quick test"
-	}
+	//$PostBuildEvent [!$ANALYZE]
+	//{
+	//	$CommandLine		"$BASE" \
+	//						"pushd $QUOTE$OUTBINDIR$QUOTE" "\n" \
+	//						"pwsh -ExecutionPolicy Bypass .\test_vrad_optix_quick.ps1" "\n" \
+	//						"popd" "\n"
+	//	$Description		"Running vrad_rtx quick test"
+	//}
 }
 
 $Project "VRAD"

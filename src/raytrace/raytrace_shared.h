@@ -49,6 +49,9 @@ struct CUDATriangle {
   unsigned char unused;
 };
 
+// Sky face triangle ID flag — matches TRACE_ID_SKY in vrad.h
+#define TRACE_ID_SKY_GPU 0x01000000
+
 // Ray input data for GPU tracing
 struct RayBatch {
   float3_t origin;

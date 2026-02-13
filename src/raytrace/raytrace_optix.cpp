@@ -126,6 +126,11 @@ int RayTraceOptiX::s_bounceNumPatches = 0;
 int RayTraceOptiX::s_bounceTotalTransfers = 0;
 bool RayTraceOptiX::s_bounceInitialized = false;
 
+// Sky direction sample buffer (device)
+float3_t *RayTraceOptiX::s_d_skyDirs = nullptr;
+int RayTraceOptiX::s_numSkyDirs = 0;
+float RayTraceOptiX::s_sunAngularExtent = 0.0f;
+
 // Bounce GPU profiling accumulators (milliseconds from CUDA events)
 static float s_bounceUploadMs = 0.0f;
 static float s_bounceKernelMs = 0.0f;
@@ -162,6 +167,16 @@ struct OptixLaunchParams {
   int num_samples;
   int num_lights;
   int num_clusters;
+
+  // Sky Light Extension (Phase 2b) — must match optix_kernels.cu
+  const float3_t *d_skyDirs; // Precomputed hemisphere sample directions
+  int numSkyDirs;            // Number of sky sample directions (162 default)
+  float sunAngularExtent;    // Area sun jitter (0 = point sun)
+  int numSunSamples;         // Samples for area sun (30 default, 0 = point sun)
+
+  // Sun Shadow Anti-aliasing
+  int sunShadowSamples;  // Sub-luxel position samples (default 16)
+  float sunShadowRadius; // World-space jitter radius in units (default 4.0)
 };
 
 // Embedded PTX (will be set during build or loaded from file)
@@ -481,6 +496,9 @@ void RayTraceOptiX::Shutdown() {
     cudaFree((void *)s_visData.patches); // Cast required due to struct type
   if (s_visData.pvsData)
     cudaFree(s_visData.pvsData);
+
+  // Free sky direction buffer
+  FreeSkyDirections();
 
   if (s_pipeline)
     optixPipelineDestroy((OptixPipeline)s_pipeline);
@@ -934,6 +952,14 @@ void RayTraceOptiX::TraceDirectLighting(int numSamples) {
   extern int GetGPUClusterCount(); // forward decl
   params.num_clusters = GetGPUClusterCount();
 
+  // Sky light parameters
+  params.d_skyDirs = s_d_skyDirs;
+  params.numSkyDirs = s_numSkyDirs;
+  params.sunAngularExtent = s_sunAngularExtent;
+  params.numSunSamples = (s_sunAngularExtent > 0.0f) ? 30 : 0;
+  params.sunShadowSamples = 16;  // Sub-luxel anti-aliasing
+  params.sunShadowRadius = 2.0f; // World-space jitter radius
+
   // Upload params to device
   CUDA_CHECK_VOID(cudaMemcpy(s_d_launchParams[0], &params,
                              sizeof(OptixLaunchParams),
@@ -960,6 +986,78 @@ void RayTraceOptiX::TraceDirectLighting(int numSamples) {
 
   // Synchronize — results needed immediately
   CUDA_CHECK_VOID(cudaStreamSynchronize(stream));
+}
+
+//-----------------------------------------------------------------------------
+// UploadSkyDirections — Precompute hemisphere sample directions and upload
+// Uses Halton sequence (bases 2, 3) matching CPU's DirectionalSampler_t
+//-----------------------------------------------------------------------------
+void RayTraceOptiX::UploadSkyDirections(float sunAngularExtent) {
+  if (!s_bInitialized)
+    return;
+
+  s_sunAngularExtent = sunAngularExtent;
+
+  // Precompute sky sample directions using Halton sequence, matching CPU
+  const int NUM_SKY_DIRS = 162; // NUMVERTEXNORMALS
+  float3_t skyDirs[162];
+
+  // Generate directions using Halton(2, 3) - same as DirectionalSampler_t
+  for (int j = 0; j < NUM_SKY_DIRS; j++) {
+    // Halton base-2 for z value
+    float zvalue = 0;
+    {
+      float f = 0.5f;
+      int i = j + 1;
+      while (i > 0) {
+        zvalue += (i & 1) * f;
+        i >>= 1;
+        f *= 0.5f;
+      }
+    }
+    zvalue = 2.0f * zvalue - 1.0f; // map [0,1] to [-1,1]
+    float phi = acosf(zvalue);
+
+    // Halton base-3 for rotation angle
+    float vrot = 0;
+    {
+      float f = 1.0f / 3.0f;
+      int i = j + 1;
+      while (i > 0) {
+        vrot += (i % 3) * f;
+        i /= 3;
+        f /= 3.0f;
+      }
+    }
+    float theta = 2.0f * 3.14159265358979323846f * vrot;
+    float sin_p = sinf(phi);
+
+    skyDirs[j].x = cosf(theta) * sin_p;
+    skyDirs[j].y = sinf(theta) * sin_p;
+    skyDirs[j].z = zvalue;
+  }
+
+  // Upload to GPU
+  FreeSkyDirections(); // Free any existing buffer
+  CUDA_CHECK_VOID(cudaMalloc(&s_d_skyDirs, NUM_SKY_DIRS * sizeof(float3_t)));
+  CUDA_CHECK_VOID(cudaMemcpy(s_d_skyDirs, skyDirs,
+                             NUM_SKY_DIRS * sizeof(float3_t),
+                             cudaMemcpyHostToDevice));
+  s_numSkyDirs = NUM_SKY_DIRS;
+
+  Msg("Uploaded %d sky sample directions (sunExtent=%.4f)\n", NUM_SKY_DIRS,
+      sunAngularExtent);
+}
+
+//-----------------------------------------------------------------------------
+// FreeSkyDirections — Free device memory for sky direction buffer
+//-----------------------------------------------------------------------------
+void RayTraceOptiX::FreeSkyDirections() {
+  if (s_d_skyDirs) {
+    cudaFree(s_d_skyDirs);
+    s_d_skyDirs = nullptr;
+  }
+  s_numSkyDirs = 0;
 }
 
 // CUDA kernel launcher declarations (defined in raytrace_cuda.cu)

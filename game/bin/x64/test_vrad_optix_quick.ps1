@@ -183,7 +183,7 @@ try {
     # --- Phase 3: Test Run (vrad_rtx.exe -cuda) ---
     Write-LogMessage "--- Compiling test map (vrad_rtx.exe -cuda) ---"
     $fullLogPath = Join-Path (Get-Location).Path $CUDA_LOG
-    Write-LogMessage "vrad_rtx.exe -avx2 -cuda Log: $fullLogPath"
+    Write-LogMessage "vrad_rtx.exe -cuda Log: $fullLogPath"
     $start = Get-Date
 
     # Use .NET Process class with event-based async output draining.
@@ -195,7 +195,7 @@ try {
     # async callbacks that are guaranteed to drain the pipes.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = (Resolve-Path ".\vrad_rtx.exe").Path
-    $psi.Arguments = "-game $MOD_DIR -cuda $TEST_DIR\$MAP_NAME"
+    $psi.Arguments = "-game $MOD_DIR -cuda -avx2 $TEST_DIR\$MAP_NAME"
     $psi.WorkingDirectory = (Get-Location).Path
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $false

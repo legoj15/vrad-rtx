@@ -40,9 +40,17 @@ long g_nLightsSkippedDistance[MAX_TOOL_THREADS];
 long g_nLightsSkippedPVS[MAX_TOOL_THREADS];
 long g_nLightsSkippedZeroDot[MAX_TOOL_THREADS];
 long g_nGatherSSECalls[MAX_TOOL_THREADS];
-long g_nRaysDeferred[MAX_TOOL_THREADS];
+
 long g_nSSGradientQualified[MAX_TOOL_THREADS];
 long g_nSSGradientTotal[MAX_TOOL_THREADS];
+
+// BuildFacelights sub-phase timing (per-thread accumulators, seconds)
+double g_flBFL_Setup[MAX_TOOL_THREADS]; // InitLightinfo + CalcPoints +
+                                        // InitSampleInfo
+double g_flBFL_IllumNormals
+    [MAX_TOOL_THREADS]; // ComputeIlluminationPointAndNormalsSSE
+double g_flBFL_SkyGather[MAX_TOOL_THREADS]; // GatherSampleLight_CollectGPURays
+long g_nBFL_FacesProcessed[MAX_TOOL_THREADS];
 
 #define SMOOTHING_GROUP_HARD_EDGE 0xff000000
 
@@ -894,6 +902,12 @@ directlight_t **g_ClusterLights =
 int *g_nClusterLights = nullptr;
 int g_nTotalClusterLightEntries = 0;
 
+// Sky-only light list: contains only emit_skylight and emit_skyambient lights.
+// Used by the GPU path to avoid iterating the full per-cluster light list
+// (which is 98%+ standard lights that the GPU kernel handles).
+static directlight_t **g_SkyLights = nullptr;
+static int g_nSkyLights = 0;
+
 facelight_t facelight[MAX_MAP_FACES];
 int numdlights;
 
@@ -1613,6 +1627,30 @@ void BuildPerClusterLightLists() {
       numdlights);
   Msg("  Lights per cluster: avg=%.1f, min=%d, max=%d, entries=%d\n", avgLights,
       minLights, maxLights, g_nTotalClusterLightEntries);
+
+  // Build sky-only light list for GPU path.
+  // Sky/ambient lights are global (visible everywhere), so no per-cluster
+  // filtering is needed. This avoids iterating 119+ lights per cluster just
+  // to skip 98% of them in the GPU gather function.
+  int skyCount = 0;
+  for (directlight_t *dl = activelights; dl != NULL; dl = dl->next) {
+    if (dl->light.type == emit_skylight || dl->light.type == emit_skyambient)
+      skyCount++;
+  }
+  if (g_SkyLights) {
+    delete[] g_SkyLights;
+    g_SkyLights = nullptr;
+  }
+  g_nSkyLights = skyCount;
+  if (skyCount > 0) {
+    g_SkyLights = new directlight_t *[skyCount];
+    int idx = 0;
+    for (directlight_t *dl = activelights; dl != NULL; dl = dl->next) {
+      if (dl->light.type == emit_skylight || dl->light.type == emit_skyambient)
+        g_SkyLights[idx++] = dl;
+    }
+  }
+  Msg("  Sky/ambient lights (GPU fast path): %d\n", g_nSkyLights);
 }
 
 /*
@@ -2495,144 +2533,21 @@ static void ComputeIlluminationPointAndNormalsSSE(lightinfo_t const &l,
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
 //-----------------------------------------------------------------------------
-// Deferred shadow ray metadata for GPU batching.
-// Ray geometry (origin, direction, tmax) is stored separately in g_threadRays
-// for zero-copy GPU submission.
-//-----------------------------------------------------------------------------
-struct DeferredShadowRay_t {
-  facelight_t *pFaceLight; // Which face's lightmaps to write to
-  int sampleIdx;
-  uint8_t numSamples;  // Always 1-4, packed from int
-  uint8_t normalCount; // Always 1-4, packed from int
-  int lightStyleIndex;
-  int rayArrayOffset; // Offset into g_threadRays for this entry's rays
-  fltx4 fxdot[NUM_BUMP_VECTS + 1];
-  Vector lightIntensity;
-  float sunAmountScalar; // Scalar: standard lights always have sunAmount=0
-};
-
-// Thread-local buffers — metadata and GPU-ready rays stored in parallel
-static CUtlVector<DeferredShadowRay_t> g_threadShadowRays[MAX_TOOL_THREADS];
-static CUtlVector<RayBatch> g_threadRays[MAX_TOOL_THREADS];
-
-//-----------------------------------------------------------------------------
-// Collect phase: compute light math, defer standard light shadow rays.
-// Called per sample group (4 samples) inside the group loop.
-// Sky/ambient lights are traced and applied immediately on CPU.
+// GPU path: gather sky/ambient lights only.
+// Standard lights (point, surface, spot) are handled by the GPU direct
+// lighting kernel. This function iterates only g_SkyLights[] (typically 1-5
+// lights) instead of the full per-cluster list (avg 119 lights), eliminating
+// 98%+ of wasted iterations.
 //-----------------------------------------------------------------------------
 static void GatherSampleLight_CollectGPURays(SSE_SampleInfo_t &info,
                                              int sampleIdx, int numSamples,
                                              int iThread) {
   SSE_sampleLightOutput_t out;
-  CUtlVector<DeferredShadowRay_t> &deferredRays = g_threadShadowRays[iThread];
-  CUtlVector<RayBatch> &rayBuf = g_threadRays[iThread];
 
-  // Pre-compute whether all samples share the same cluster (same as CPU path)
-  bool allSameCluster =
-      (numSamples <= 1) ||
-      (info.m_Clusters[0] == info.m_Clusters[1] &&
-       (numSamples <= 2 || info.m_Clusters[0] == info.m_Clusters[2]) &&
-       (numSamples <= 3 || info.m_Clusters[0] == info.m_Clusters[3]));
-
-  // Use per-cluster light lists when available (replaces activelights
-  // iteration) For allSameCluster: iterate only lights visible from cluster[0].
-  // For mixed clusters: iterate a merged set from all sample clusters.
-  int clusterLightCount = 0;
-  directlight_t **clusterLightList = nullptr;
-
-  // Merged-cluster temp buffer (only used for mixed-cluster case)
-  CUtlVector<directlight_t *> mergedLights;
-
-  if (g_ClusterLightFlat && allSameCluster && info.m_Clusters[0] >= 0) {
-    clusterLightList =
-        &g_ClusterLightFlat[g_ClusterLightOffsets[info.m_Clusters[0]]];
-    clusterLightCount = g_nClusterLights[info.m_Clusters[0]];
-  } else if (g_ClusterLightFlat && !allSameCluster) {
-    // Build union of lights from all sample clusters
-    for (int s = 0; s < numSamples; s++) {
-      int c = info.m_Clusters[s];
-      if (c < 0)
-        continue;
-      for (int li = 0; li < g_nClusterLights[c]; li++) {
-        directlight_t *dl = g_ClusterLightFlat[g_ClusterLightOffsets[c] + li];
-        if (mergedLights.Find(dl) == mergedLights.InvalidIndex())
-          mergedLights.AddToTail(dl);
-      }
-    }
-    clusterLightList = mergedLights.Base();
-    clusterLightCount = mergedLights.Count();
-  }
-
-  // Fallback: iterate all lights if no per-cluster data
-  bool useClusterList = (clusterLightList != nullptr && clusterLightCount > 0);
-
-  directlight_t *dl = useClusterList ? nullptr : activelights;
-  for (int li_idx = 0;; li_idx++) {
-    if (useClusterList) {
-      if (li_idx >= clusterLightCount)
-        break;
-      dl = clusterLightList[li_idx];
-    } else {
-      if (li_idx > 0)
-        dl = dl->next;
-      if (dl == nullptr)
-        break;
-    }
-
-    // Early distance cull: only for lights with explicit hard-falloff
-    // distances. Asymptotic falloff lights (without m_flEndFadeDistance) cannot
-    // be safely distance-culled — even 0.4% cull rate caused 24.7% lightmap
-    // differences.
-    if (dl->facenum == -1 &&
-        dl->m_flEndFadeDistance > dl->m_flStartFadeDistance) {
-      float endFade2 = dl->m_flEndFadeDistance * dl->m_flEndFadeDistance;
-      float minDist2 = 1.0e22f;
-      for (int s = 0; s < numSamples; s++) {
-        float dx = dl->light.origin.x - SubFloat(info.m_Points.x, s);
-        float dy = dl->light.origin.y - SubFloat(info.m_Points.y, s);
-        float dz = dl->light.origin.z - SubFloat(info.m_Points.z, s);
-        float d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 < minDist2)
-          minDist2 = d2;
-      }
-      if (minDist2 > endFade2) {
-        g_nLightsSkippedDistance[iThread]++;
-        continue;
-      }
-    }
-
-    // PVS check: skip if using per-cluster lists for allSameCluster
-    // (already filtered). For mixed clusters, we still need per-sample masking.
-    fltx4 dotMask;
-    bool skipLight;
-    if (allSameCluster) {
-      // Per-cluster lists already guarantee PVS visibility
-      dotMask = Four_Ones;
-      skipLight = false;
-    } else {
-      dotMask = Four_Zeros;
-      skipLight = true;
-      for (int s = 0; s < numSamples; s++) {
-        if (PVSCheck(dl->pvs, info.m_Clusters[s])) {
-          dotMask = SetComponentSIMD(dotMask, s, 1.0f);
-          skipLight = false;
-        }
-      }
-      if (skipLight) {
-        g_nLightsSkippedPVS[iThread]++;
-        continue;
-      }
-    }
-
-    bool isStandardLight =
-        (dl->light.type == emit_point || dl->light.type == emit_surface ||
-         dl->light.type == emit_spotlight);
-
-    // Phase 3: standard lights are handled entirely by
-    // __raygen__direct_lighting on GPU. Skip them here to avoid
-    // double-counting.
-    if (isStandardLight)
-      continue;
+  // Iterate only sky/ambient lights — no per-cluster lookup needed since
+  // sky lights are global (PVS-visible from everywhere by definition).
+  for (int li = 0; li < g_nSkyLights; li++) {
+    directlight_t *dl = g_SkyLights[li];
 
     // Sky lights (emit_skylight, emit_skyambient) are computed fully on CPU.
     GatherSampleLightSSE(out, dl, info.m_FaceNum, info.m_Points,
@@ -2641,10 +2556,9 @@ static void GatherSampleLight_CollectGPURays(SSE_SampleInfo_t &info,
     g_nGatherSSECalls[iThread]++;
 
     fltx4 fxdot[NUM_BUMP_VECTS + 1];
-    skipLight = true;
+    bool skipLight = true;
     for (int b = 0; b < info.m_NormalCount; b++) {
-      fxdot[b] = MulSIMD(out.m_flDot[b], dotMask);
-      fxdot[b] = MulSIMD(fxdot[b], out.m_flFalloff);
+      fxdot[b] = MulSIMD(out.m_flDot[b], out.m_flFalloff);
       if (!IsAllZeros(fxdot[b]))
         skipLight = false;
     }
@@ -2665,166 +2579,16 @@ static void GatherSampleLight_CollectGPURays(SSE_SampleInfo_t &info,
       continue;
     }
 
-    if (isStandardLight) {
-      // Compute direction and length (SSE, 4 rays at once)
-      FourVectors dir = out.m_raySource;
-      dir -= info.m_Points;
-      fltx4 len = dir.length();
-      fltx4 rcpLen = ReciprocalSIMD(len);
-      dir *= rcpLen;
+    LightingValue_t **pLightmaps = info.m_pFaceLight->light[lightStyleIndex];
 
-      // Write RayBatch entries directly into GPU-ready buffer
-      int rayOffset = rayBuf.Count();
+    for (int n = 0; n < info.m_NormalCount; ++n) {
       for (int i = 0; i < numSamples; i++) {
-        RayBatch &ray = rayBuf[rayBuf.AddToTail()];
-        ray.origin = {info.m_Points.X(i), info.m_Points.Y(i),
-                      info.m_Points.Z(i)};
-        ray.direction = {dir.X(i), dir.Y(i), dir.Z(i)};
-        ray.tmin = 0.0f;
-        ray.tmax = SubFloat(len, i);
-        ray.skip_id = -1;
-      }
-
-      // Store metadata (no ray geometry — it's in rayBuf)
-      DeferredShadowRay_t &deferred = deferredRays[deferredRays.AddToTail()];
-      deferred.pFaceLight = info.m_pFaceLight;
-      deferred.sampleIdx = sampleIdx;
-      deferred.numSamples = (uint8_t)numSamples;
-      deferred.lightStyleIndex = lightStyleIndex;
-      deferred.normalCount = (uint8_t)info.m_NormalCount;
-      deferred.rayArrayOffset = rayOffset;
-      for (int b = 0; b < info.m_NormalCount; b++)
-        deferred.fxdot[b] = fxdot[b];
-      deferred.lightIntensity = dl->light.intensity;
-      deferred.sunAmountScalar = SubFloat(out.m_flSunAmount, 0);
-      g_nRaysDeferred[iThread] += numSamples;
-    } else {
-      LightingValue_t **pLightmaps = info.m_pFaceLight->light[lightStyleIndex];
-
-      if (g_pIncremental && (dl->light.style == 0)) {
-        for (int i = 0; i < numSamples; i++) {
-          g_pIncremental->AddLightToFace(dl->m_IncrementalID, info.m_FaceNum,
-                                         sampleIdx + i, info.m_LightmapSize,
-                                         SubFloat(fxdot[0], i), info.m_iThread);
-        }
-      }
-
-      for (int n = 0; n < info.m_NormalCount; ++n) {
-        for (int i = 0; i < numSamples; i++) {
-          pLightmaps[n][sampleIdx + i].AddLight(SubFloat(fxdot[n], i),
-                                                dl->light.intensity,
-                                                SubFloat(out.m_flSunAmount, i));
-        }
+        pLightmaps[n][sampleIdx + i].AddLight(SubFloat(fxdot[n], i),
+                                              dl->light.intensity,
+                                              SubFloat(out.m_flSunAmount, i));
       }
     }
   }
-}
-
-// Max rays per thread before flushing to GPU.
-// Controlled by -gpuraybatch CLI arg (default 250K = ~9 MB per thread).
-// Lower values reduce peak RAM at the cost of more frequent GPU submissions.
-#define GPU_RAY_FLUSH_THRESHOLD g_nGPURayBatchSize
-
-//-----------------------------------------------------------------------------
-// Flush a single thread's accumulated rays: trace on GPU, apply results.
-// Called when a thread exceeds the threshold or during tail flush.
-//-----------------------------------------------------------------------------
-static void FlushThreadShadowRays(int iThread) {
-  CUtlVector<RayBatch> &rayBuf = g_threadRays[iThread];
-  CUtlVector<DeferredShadowRay_t> &metaBuf = g_threadShadowRays[iThread];
-  int numRays = rayBuf.Count();
-  int numMeta = metaBuf.Count();
-  if (numRays == 0)
-    return;
-
-  RayResult *results = new RayResult[numRays];
-  RayTraceOptiX::TraceBatch(rayBuf.Base(), results, numRays);
-
-  // Apply visibility results using metadata
-  for (int d = 0; d < numMeta; d++) {
-    DeferredShadowRay_t &def = metaBuf[d];
-    LightingValue_t **pLightmaps = def.pFaceLight->light[def.lightStyleIndex];
-
-    for (int i = 0; i < def.numSamples; i++) {
-      int ri = def.rayArrayOffset + i;
-      if (results[ri].hit_id == -1 || results[ri].hit_t >= rayBuf[ri].tmax) {
-        for (int n = 0; n < def.normalCount; ++n) {
-          pLightmaps[n][def.sampleIdx + i].AddLight(SubFloat(def.fxdot[n], i),
-                                                    def.lightIntensity,
-                                                    def.sunAmountScalar);
-        }
-      }
-    }
-  }
-
-  delete[] results;
-  metaBuf.RemoveAll();
-  rayBuf.RemoveAll();
-}
-
-//-----------------------------------------------------------------------------
-// Tail flush: merge ALL threads' remaining rays into a single GPU batch.
-// This avoids N separate TraceBatch calls (and N mutex acquisitions).
-//-----------------------------------------------------------------------------
-void FlushAllThreadShadowRays() {
-  // Count totals
-  int totalRays = 0, totalMeta = 0;
-  for (int t = 0; t < MAX_TOOL_THREADS; t++) {
-    totalRays += g_threadRays[t].Count();
-    totalMeta += g_threadShadowRays[t].Count();
-  }
-  if (totalRays == 0)
-    return;
-
-  // Merge into flat arrays
-  RayBatch *mergedRays = new RayBatch[totalRays];
-  DeferredShadowRay_t *mergedMeta = new DeferredShadowRay_t[totalMeta];
-
-  int rayOff = 0, metaOff = 0;
-  for (int t = 0; t < MAX_TOOL_THREADS; t++) {
-    auto &rays = g_threadRays[t];
-    auto &meta = g_threadShadowRays[t];
-
-    if (rays.Count() > 0)
-      memcpy(mergedRays + rayOff, rays.Base(), rays.Count() * sizeof(RayBatch));
-
-    for (int m = 0; m < meta.Count(); m++) {
-      mergedMeta[metaOff + m] = meta[m];
-      mergedMeta[metaOff + m].rayArrayOffset += rayOff;
-    }
-
-    rayOff += rays.Count();
-    metaOff += meta.Count();
-
-    rays.RemoveAll();
-    meta.RemoveAll();
-  }
-
-  // Single GPU trace
-  RayResult *results = new RayResult[totalRays];
-  RayTraceOptiX::TraceBatch(mergedRays, results, totalRays);
-
-  // Apply visibility results
-  for (int d = 0; d < totalMeta; d++) {
-    DeferredShadowRay_t &def = mergedMeta[d];
-    LightingValue_t **pLightmaps = def.pFaceLight->light[def.lightStyleIndex];
-
-    for (int i = 0; i < def.numSamples; i++) {
-      int ri = def.rayArrayOffset + i;
-      if (results[ri].hit_id == -1 ||
-          results[ri].hit_t >= mergedRays[ri].tmax) {
-        for (int n = 0; n < def.normalCount; ++n) {
-          pLightmaps[n][def.sampleIdx + i].AddLight(SubFloat(def.fxdot[n], i),
-                                                    def.lightIntensity,
-                                                    def.sunAmountScalar);
-        }
-      }
-    }
-  }
-
-  delete[] results;
-  delete[] mergedRays;
-  delete[] mergedMeta;
 }
 #endif // VRAD_RTX_CUDA_SUPPORT
 
@@ -3041,6 +2805,15 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
       if (dl == nullptr)
         break;
     }
+
+#ifdef VRAD_RTX_CUDA_SUPPORT
+    // GPU path: skip non-sky lights in supersampling. Point/surface/spot
+    // lights are from GPU kernel. Only sky lights are CPU-evaluated and
+    // need to be re-evaluated at sub-positions.
+    if (g_bUseGPU && dl->light.type != emit_skylight &&
+        dl->light.type != emit_skyambient)
+      continue;
+#endif
 
     if ((flags & AMBIENT_ONLY) && (dl->light.type != emit_skyambient))
       continue;
@@ -3353,6 +3126,24 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
   // Compute the maximum intensity of all lighting associated with this
   // lightstyle for all bumped lighting
   LightingValue_t **ppLightSamples = info.m_pFaceLight->light[lightstyleIndex];
+
+#ifdef VRAD_RTX_CUDA_SUPPORT
+  // GPU path: subtract GPU point light contributions before gradient
+  // detection. Point lights are from GPU kernel and differ subtly from
+  // CPU BSP tracing, which would trigger excess gradients. They are
+  // added back unchanged after the SS loop.
+  if (g_bUseGPU && lightstyleIndex == 0) {
+    for (int n = 0; n < info.m_NormalCount; ++n) {
+      if (info.m_pFaceLight->gpu_point[n]) {
+        for (int s = 0; s < info.m_pFaceLight->numsamples; ++s) {
+          ppLightSamples[n][s].m_vecLighting -=
+              info.m_pFaceLight->gpu_point[n][s].m_vecLighting;
+        }
+      }
+    }
+  }
+#endif
+
   ComputeSampleIntensities(info, ppLightSamples, pSampleIntensity);
 
   Vector *pVisualizePass = NULL;
@@ -3409,8 +3200,15 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
       }
 
       // Supersample the ambient light for each bump direction vector
-      int ambientSupersampleCount = SupersampleLightAtPoint(
-          l, info, i, lightstyleIndex, pAmbientLight, AMBIENT_ONLY);
+#ifdef VRAD_RTX_CUDA_SUPPORT
+      int ambientSupersampleCount = 0;
+      if (!g_bUseGPU) {
+#endif
+        ambientSupersampleCount = SupersampleLightAtPoint(
+            l, info, i, lightstyleIndex, pAmbientLight, AMBIENT_ONLY);
+#ifdef VRAD_RTX_CUDA_SUPPORT
+      }
+#endif
 
       // Supersample the non-ambient light for each bump direction vector
       int directSupersampleCount = SupersampleLightAtPoint(
@@ -3418,13 +3216,19 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
 
       // Because of sampling problems, small area triangles may have no
       // samples. In this case, just use what we already have
-      if (ambientSupersampleCount > 0 && directSupersampleCount > 0) {
+      bool canApply =
+          (ambientSupersampleCount > 0 && directSupersampleCount > 0);
+      if (canApply) {
         // Add the ambient + directional terms together, stick it back into
         // the lightmap
         for (int n = 0; n < info.m_NormalCount; ++n) {
           ppLightSamples[n][i].Zero();
           ppLightSamples[n][i].AddWeighted(pDirectLight[n],
                                            1.0f / directSupersampleCount);
+#ifdef VRAD_RTX_CUDA_SUPPORT
+          // GPU path: ambient sky is correctly re-evaluated at
+          // sub-positions via RS4Pts (only sky lights evaluated).
+#endif
           ppLightSamples[n][i].AddWeighted(pAmbientLight[n],
                                            1.0f / ambientSupersampleCount);
         }
@@ -3437,6 +3241,22 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
     // We've finished another pass
     pass++;
   }
+
+#ifdef VRAD_RTX_CUDA_SUPPORT
+  // GPU path: add back GPU point light contributions (unfiltered) to all
+  // samples. They were subtracted before gradient detection to prevent
+  // excess gradients from GPU/CPU tracing differences.
+  if (g_bUseGPU && lightstyleIndex == 0) {
+    for (int n = 0; n < info.m_NormalCount; ++n) {
+      if (info.m_pFaceLight->gpu_point[n]) {
+        for (int s = 0; s < info.m_pFaceLight->numsamples; ++s) {
+          ppLightSamples[n][s].m_vecLighting +=
+              info.m_pFaceLight->gpu_point[n][s].m_vecLighting;
+        }
+      }
+    }
+  }
+#endif
 
   if (debug_extra) {
     // Copy colors representing which supersample pass the sample was messed
@@ -3460,7 +3280,7 @@ static void InitSampleInfo(lightinfo_t const &l, int iThread,
 // After the GPU direct lighting kernel has computed primary sample lighting,
 // this function runs full CPU supersampling (all gradient passes) at
 // supersample positions and builds patch lights. Called via
-// RunThreadsOnIndividual after FlushAllThreadShadowRays + GPU direct lighting.
+// RunThreadsOnIndividual after GPU direct lighting.
 //-----------------------------------------------------------------------------
 void FinalizeAndSupersample(int iThread, int facenum) {
   dface_t *f = &g_pFaces[facenum];
@@ -3623,6 +3443,7 @@ void BuildFacelights(int iThread, int facenum) {
 
   fl = &facelight[facenum];
 
+  double tSetupStart = Plat_FloatTime();
   InitLightinfo(&l, facenum);
   CalcPoints(&l, fl, facenum);
   InitSampleInfo(l, iThread, sampleInfo);
@@ -3634,6 +3455,10 @@ void BuildFacelights(int iThread, int facenum) {
   // always allocate style 0 lightmap
   f->styles[0] = 0;
   AllocateLightstyleSamples(fl, 0, sampleInfo.m_NormalCount);
+  double tSetupEnd = Plat_FloatTime();
+  g_flBFL_Setup[iThread] += (tSetupEnd - tSetupStart);
+
+  double tIllumAccum = 0;
 
   // sample the lights at each sample location
   for (int grp = 0; grp < numGroups; ++grp) {
@@ -3653,8 +3478,10 @@ void BuildFacelights(int iThread, int facenum) {
     positions.LoadAndSwizzle(v[0], v[1], v[2], v[3]);
     normals.LoadAndSwizzle(n[0], n[1], n[2], n[3]);
 
+    double tIllumStart = Plat_FloatTime();
     ComputeIlluminationPointAndNormalsSSE(l, positions, normals, &sampleInfo,
                                           numSamples);
+    tIllumAccum += Plat_FloatTime() - tIllumStart;
 
     // Fixup sample normals in case of smooth faces
     if (!l.isflat) {
@@ -3665,21 +3492,25 @@ void BuildFacelights(int iThread, int facenum) {
     // Iterate over all the lights and add their contribution to this group
     // of spots
 #ifdef VRAD_RTX_CUDA_SUPPORT
-    if (g_bUseGPU)
+    if (g_bUseGPU) {
+      // GPU path: point/surface/spot lights handled by GPU kernel.
+      // Sky lights (sun + ambient) evaluated here on CPU so the
+      // supersampler can smooth them without GPU/CPU mismatch.
+      double tSkyStart = Plat_FloatTime();
       GatherSampleLight_CollectGPURays(sampleInfo, nSample, numSamples,
                                        iThread);
-    else
+      g_flBFL_SkyGather[iThread] += Plat_FloatTime() - tSkyStart;
+    } else
 #endif
       GatherSampleLightAt4Points(sampleInfo, nSample, numSamples);
   }
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
-  // GPU path: rays accumulated in thread-local buffer, return early.
-  // Flush to GPU when threshold exceeded to bound memory usage.
-  // Remaining rays flushed by FlushAllThreadShadowRays after all threads.
+  // GPU path: all lighting is computed by GPU direct lighting kernel.
+  // Only setup + illum normals were needed from the CPU side.
   if (g_bUseGPU) {
-    if (g_threadRays[iThread].Count() >= GPU_RAY_FLUSH_THRESHOLD)
-      FlushThreadShadowRays(iThread);
+    g_flBFL_IllumNormals[iThread] += tIllumAccum;
+    g_nBFL_FacesProcessed[iThread]++;
     return;
   }
 #endif

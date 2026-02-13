@@ -11,7 +11,6 @@
 #include "tier1/utlblockmemory.h"
 #include "tier1/utlvector.h"
 
-
 #include "visibility_gpu.h"
 
 // Forward declarations - matching public/raytrace.h struct declarations
@@ -52,6 +51,10 @@ public:
 
   // Direct Lighting (Phase 2)
   static void TraceDirectLighting(int numSamples);
+
+  // Sky Light Support (Phase 2b)
+  static void UploadSkyDirections(float sunAngularExtent);
+  static void FreeSkyDirections();
 
   // Device info
   static const char *GetDeviceName() { return s_szDeviceName; }
@@ -125,6 +128,11 @@ private:
   static int s_bounceNumPatches;
   static int s_bounceTotalTransfers;
   static bool s_bounceInitialized;
+
+  // Sky direction sample buffer
+  static float3_t *s_d_skyDirs; // Device pointer
+  static int s_numSkyDirs;
+  static float s_sunAngularExtent;
 
 public:
   // GPU Bounce light gathering

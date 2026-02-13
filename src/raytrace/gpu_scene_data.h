@@ -45,8 +45,12 @@ struct GPUFaceInfo {
 // 4 channels: [0]=flat normal, [1..3]=bump basis normals.
 // Non-bumpmapped faces only use channel [0].
 struct GPULightOutput {
-  float r[4], g[4], b[4]; // Per-bump-vector accumulated light color
+  float r[4], g[4],
+      b[4];        // Per-bump-vector accumulated light (point/surface/spot)
   float sunAmount; // Accumulated sun amount (always 0 for standard lights)
+  float sun_r[4], sun_g[4], sun_b[4]; // Sun (emit_skylight) contribution only
+  float sky_r[4], sky_g[4],
+      sky_b[4]; // Ambient sky (emit_skyambient) contribution only
 };
 
 //-----------------------------------------------------------------------------

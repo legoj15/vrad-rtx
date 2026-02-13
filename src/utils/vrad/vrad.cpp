@@ -1835,7 +1835,7 @@ void BounceLight(void) {
     } else
 #endif
     {
-      RunThreadsOn(uiPatchCount, true, GatherLight);
+      RunThreadsOn(uiPatchCount, false, GatherLight);
     }
     double endBounce = Plat_FloatTime();
 
@@ -2170,9 +2170,9 @@ bool RadWorld_Go() {
 
     double gpuDirectTime = 0;
 #ifdef VRAD_RTX_CUDA_SUPPORT
-    // GPU mega-batching: flush deferred direct lighting shadow rays,
+    // GPU path: launch direct lighting kernel,
     // then run CPU supersampling + patch lights.
-    double flushShadowTime = 0, ssTime = 0;
+    double ssTime = 0;
     double sceneDataUploadTime = 0;
     if (g_bUseGPU) {
       // Upload all sample/face/cluster data to VRAM
@@ -2193,10 +2193,6 @@ bool RadWorld_Go() {
         DownloadAndApplyGPUResults();
         gpuDirectTime = Plat_FloatTime() - dlStart;
       }
-
-      phaseStart = Plat_FloatTime();
-      FlushAllThreadShadowRays();
-      flushShadowTime = Plat_FloatTime() - phaseStart;
 
       // CPU supersampling + patch lights (all gradient passes, all lights)
       phaseStart = Plat_FloatTime();
@@ -2224,10 +2220,6 @@ bool RadWorld_Go() {
           g_flDirectLightingTime > 0
               ? 100.0 * gpuDirectTime / g_flDirectLightingTime
               : 0);
-      Msg("  FlushShadowRays:   %6.2f s  (%4.1f%%)\n", flushShadowTime,
-          g_flDirectLightingTime > 0
-              ? 100.0 * flushShadowTime / g_flDirectLightingTime
-              : 0);
       Msg("  SS + PatchLights:  %6.2f s  (%4.1f%%)\n", ssTime,
           g_flDirectLightingTime > 0 ? 100.0 * ssTime / g_flDirectLightingTime
                                      : 0);
@@ -2237,13 +2229,12 @@ bool RadWorld_Go() {
     // Print per-thread counter summary
     {
       long totalDist = 0, totalPVS = 0, totalDot = 0, totalGather = 0;
-      long totalDeferred = 0, totalSSQualified = 0, totalSSTotal = 0;
+      long totalSSQualified = 0, totalSSTotal = 0;
       for (int t = 0; t < MAX_TOOL_THREADS; t++) {
         totalDist += g_nLightsSkippedDistance[t];
         totalPVS += g_nLightsSkippedPVS[t];
         totalDot += g_nLightsSkippedZeroDot[t];
         totalGather += g_nGatherSSECalls[t];
-        totalDeferred += g_nRaysDeferred[t];
         totalSSQualified += g_nSSGradientQualified[t];
         totalSSTotal += g_nSSGradientTotal[t];
       }
@@ -2259,12 +2250,43 @@ bool RadWorld_Go() {
             100.0 * totalGather / totalIterations);
         Msg("  Skipped (zero dot):       %12ld  (%4.1f%%)\n", totalDot,
             100.0 * totalDot / totalIterations);
-        Msg("  Rays deferred to GPU:     %12ld\n", totalDeferred);
       }
       if (totalSSTotal > 0) {
         Msg("  SS gradient: %ld qualified / %ld checked (%4.1f%%)\n",
             totalSSQualified, totalSSTotal,
             100.0 * totalSSQualified / totalSSTotal);
+      }
+
+      // BuildFacelights sub-phase breakdown (GPU path only)
+      if (g_bUseGPU) {
+        double totSetup = 0, totIllum = 0, totSky = 0;
+        long totFaces = 0;
+        for (int t = 0; t < MAX_TOOL_THREADS; t++) {
+          totSetup += g_flBFL_Setup[t];
+          totIllum += g_flBFL_IllumNormals[t];
+          totSky += g_flBFL_SkyGather[t];
+          totFaces += g_nBFL_FacesProcessed[t];
+        }
+        double totTimed = totSetup + totIllum + totSky;
+        double otherTime = (buildFacelightsTime > totTimed)
+                               ? buildFacelightsTime - totTimed
+                               : 0;
+        Msg("\nBuildFacelights GPU Sub-phases (%.2f s wall, %ld faces):\n",
+            buildFacelightsTime, totFaces);
+        Msg("  Setup (Init+CalcPts+SSEInfo):  %8.2f CPU-s  (%4.1f%%)\n",
+            totSetup,
+            buildFacelightsTime > 0 ? 100.0 * totSetup / buildFacelightsTime
+                                    : 0);
+        Msg("  IllumNormals (Phong+Cluster):  %8.2f CPU-s  (%4.1f%%)\n",
+            totIllum,
+            buildFacelightsTime > 0 ? 100.0 * totIllum / buildFacelightsTime
+                                    : 0);
+        Msg("  SkyGather (offloaded to GPU): %8.2f CPU-s  (%4.1f%%)\n", totSky,
+            buildFacelightsTime > 0 ? 100.0 * totSky / buildFacelightsTime : 0);
+        Msg("  Other (loop, load, fixup):     %8.2f wall-s (%4.1f%%)\n",
+            otherTime,
+            buildFacelightsTime > 0 ? 100.0 * otherTime / buildFacelightsTime
+                                    : 0);
       }
     }
 
@@ -3078,18 +3100,20 @@ void PrintUsage(int argc, char **argv) {
 }
 
 int RunVRAD(int argc, char **argv) {
-#if defined(_MSC_VER) && (_MSC_VER >= 1310)
-  Msg("Valve Software - vrad.exe SSE (" __DATE__ ")\n");
-#else
-  Msg("Valve Software - vrad.exe (" __DATE__ ")\n");
-#endif
-
-  Msg("\n      Valve Radiosity Simulator     \n");
-
   verbose = true; // Originally FALSE
 
   bool onlydetail;
   int i = ParseCommandLine(argc, argv, &onlydetail);
+
+#if defined(_MSC_VER) && (_MSC_VER >= 1310)
+  Msg("Valve Software - vrad_rtx.exe %s (" __DATE__ ")\n",
+      g_bUseAVX2 ? "AVX2" : "SSE");
+#else
+  Msg("Valve Software - vrad_rtx.exe (" __DATE__ ")\n");
+#endif
+
+  Msg("\n      Valve Radiosity Simulator     \n");
+
   if (i == -1) {
     PrintUsage(argc, argv);
     DeleteCmdLine(argc, argv);

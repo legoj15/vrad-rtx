@@ -71,6 +71,13 @@ struct facelight_t {
                         [NUM_BUMP_VECTS +
                          1]; // result of direct illumination, indexed by sample
 
+#ifdef VRAD_RTX_CUDA_SUPPORT
+  // Per-sample GPU point/surface/spot light contribution, stored separately
+  // so the supersampler can subtract it before gradient detection and add
+  // it back after. Sky lights are CPU-evaluated and flow through SS normally.
+  LightingValue_t *gpu_point[NUM_BUMP_VECTS + 1];
+#endif
+
   // regularly spaced lightmap grid
   int numluxels;
   Vector *luxel;        // world space position of luxel
@@ -148,12 +155,16 @@ extern long g_nLightsSkippedDistance[MAX_TOOL_THREADS];
 extern long g_nLightsSkippedPVS[MAX_TOOL_THREADS];
 extern long g_nLightsSkippedZeroDot[MAX_TOOL_THREADS];
 extern long g_nGatherSSECalls[MAX_TOOL_THREADS];
-extern long g_nRaysDeferred[MAX_TOOL_THREADS];
 extern long g_nSSGradientQualified[MAX_TOOL_THREADS];
 extern long g_nSSGradientTotal[MAX_TOOL_THREADS];
 
+// BuildFacelights sub-phase timing (per-thread accumulators)
+extern double g_flBFL_Setup[MAX_TOOL_THREADS];
+extern double g_flBFL_IllumNormals[MAX_TOOL_THREADS];
+extern double g_flBFL_SkyGather[MAX_TOOL_THREADS];
+extern long g_nBFL_FacesProcessed[MAX_TOOL_THREADS];
+
 #ifdef VRAD_RTX_CUDA_SUPPORT
-void FlushAllThreadShadowRays();
 void FinalizeAndSupersample(int iThread, int facenum);
 void BuildGPUSceneData();
 void ShutdownGPUSceneDataBridge();

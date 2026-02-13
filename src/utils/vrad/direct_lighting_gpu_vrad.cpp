@@ -374,6 +374,9 @@ void LaunchGPUDirectLighting() {
   // Allocate and zero the output buffer
   AllocateDirectLightingOutput(numSamples);
 
+  // Upload sky sample directions for emit_skylight/emit_skyambient handling
+  RayTraceOptiX::UploadSkyDirections(g_SunAngularExtent);
+
   Msg("LaunchGPUDirectLighting: Launching kernel for %d samples...\n",
       numSamples);
 
@@ -414,40 +417,57 @@ void DownloadAndApplyGPUResults() {
       continue;
     }
 
+    int normalCount =
+        (texinfo[g_pFaces[facenum].texinfo].flags & SURF_BUMPLIGHT)
+            ? NUM_BUMP_VECTS + 1
+            : 1;
+
+    // Allocate gpu_point[] to store GPU point light contributions separately.
+    // These are subtracted before gradient detection and added back after SS.
+    for (int n = 0; n < normalCount; n++) {
+      fl.gpu_point[n] = new LightingValue_t[fl.numsamples];
+      memset(fl.gpu_point[n], 0, fl.numsamples * sizeof(LightingValue_t));
+    }
+    for (int n = normalCount; n < NUM_BUMP_VECTS + 1; n++)
+      fl.gpu_point[n] = nullptr;
+
     for (int s = 0; s < fl.numsamples; s++) {
       if (sampleCursor >= numSamples)
         break;
 
       const GPULightOutput &out = hostOutput[sampleCursor];
 
-      // Diagnostic tracking (channel [0] = flat normal)
+      // Diagnostic tracking (channel [0] = flat normal, point lights only)
       totalR += out.r[0];
       totalG += out.g[0];
       totalB += out.b[0];
       totalSun += out.sunAmount;
-      if (out.r[0] > maxR)
-        maxR = out.r[0];
-      if (out.g[0] > maxG)
-        maxG = out.g[0];
-      if (out.b[0] > maxB)
-        maxB = out.b[0];
-      if (out.r[0] == 0.0f && out.g[0] == 0.0f && out.b[0] == 0.0f)
+      float totalSampleR = out.r[0];
+      float totalSampleG = out.g[0];
+      float totalSampleB = out.b[0];
+      if (totalSampleR > maxR)
+        maxR = totalSampleR;
+      if (totalSampleG > maxG)
+        maxG = totalSampleG;
+      if (totalSampleB > maxB)
+        maxB = totalSampleB;
+      if (totalSampleR == 0.0f && totalSampleG == 0.0f && totalSampleB == 0.0f)
         zeroSamples++;
       else
         nonzeroSamples++;
 
-      // Apply per-bump-vector GPU results to lightstyle 0.
-      // The GPU kernel computed separate dot products for each bump normal,
-      // matching the CPU's GatherSampleStandardLightSSE behavior.
-      int normalCount =
-          (texinfo[g_pFaces[facenum].texinfo].flags & SURF_BUMPLIGHT)
-              ? NUM_BUMP_VECTS + 1
-              : 1;
+      // Apply per-bump-vector GPU results to lightstyle 0 AND store
+      // separately in gpu_point[] for subtract/restore during SS.
       for (int n = 0; n < normalCount; n++) {
         if (fl.light[0][n]) {
           fl.light[0][n][s].m_vecLighting.x += out.r[n];
           fl.light[0][n][s].m_vecLighting.y += out.g[n];
           fl.light[0][n][s].m_vecLighting.z += out.b[n];
+        }
+        if (fl.gpu_point[n]) {
+          fl.gpu_point[n][s].m_vecLighting.x = out.r[n];
+          fl.gpu_point[n][s].m_vecLighting.y = out.g[n];
+          fl.gpu_point[n][s].m_vecLighting.z = out.b[n];
         }
       }
       applied++;
