@@ -248,7 +248,7 @@ void ProcessSkyCameras();
 
 extern entity_t *face_entity[MAX_MAP_FACES];
 extern Vector face_offset[MAX_MAP_FACES]; // for rotating bmodels
-extern Vector face_centroids[MAX_MAP_EDGES];
+extern Vector face_centroids[MAX_MAP_FACES];
 extern int leafparents[MAX_MAP_LEAFS];
 extern int nodeparents[MAX_MAP_NODES];
 extern float lightscale;

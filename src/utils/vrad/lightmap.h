@@ -25,7 +25,9 @@ typedef struct {
   qboolean coplanar;
 } edgeshare_t;
 
-extern edgeshare_t edgeshare[MAX_MAP_EDGES];
+extern edgeshare_t *edgeshare;
+void AllocateEdgeshare();
+void FreeEdgeshare();
 
 //==============================================
 

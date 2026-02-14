@@ -77,9 +77,24 @@ private:
 };
 
 int g_iCurFace;
-edgeshare_t edgeshare[MAX_MAP_EDGES];
+edgeshare_t *edgeshare = nullptr;
 
-Vector face_centroids[MAX_MAP_EDGES];
+void AllocateEdgeshare() {
+  if (!edgeshare) {
+    edgeshare = (edgeshare_t *)calloc(MAX_MAP_EDGES, sizeof(edgeshare_t));
+    if (!edgeshare)
+      Error("Failed to allocate edgeshare array");
+  }
+}
+
+void FreeEdgeshare() {
+  if (edgeshare) {
+    free(edgeshare);
+    edgeshare = nullptr;
+  }
+}
+
+Vector face_centroids[MAX_MAP_FACES]; // indexed by face number, not edge
 
 int vertexref[MAX_MAP_VERTS];
 int *vertexface[MAX_MAP_VERTS];
@@ -2620,14 +2635,20 @@ static void GatherSampleLightAt4Points(SSE_SampleInfo_t &info, int sampleIdx,
         &g_ClusterLightFlat[g_ClusterLightOffsets[info.m_Clusters[0]]];
     clusterLightCount = g_nClusterLights[info.m_Clusters[0]];
   } else if (g_ClusterLightFlat && !allSameCluster) {
+    // Deduplicate lights across clusters using dl->index for O(1) lookup.
+    // numdlights is small (typically <1000), safe for stack allocation.
+    bool *seen = (bool *)stackalloc(numdlights * sizeof(bool));
+    memset(seen, 0, numdlights * sizeof(bool));
     for (int s = 0; s < numSamples; s++) {
       int c = info.m_Clusters[s];
       if (c < 0)
         continue;
       for (int li = 0; li < g_nClusterLights[c]; li++) {
         directlight_t *dl = g_ClusterLightFlat[g_ClusterLightOffsets[c] + li];
-        if (mergedLights.Find(dl) == mergedLights.InvalidIndex())
+        if (!seen[dl->index]) {
+          seen[dl->index] = true;
           mergedLights.AddToTail(dl);
+        }
       }
     }
     clusterLightList = mergedLights.Base();
@@ -3459,9 +3480,8 @@ void BuildFacelights(int iThread, int facenum) {
   double tSetupEnd = Plat_FloatTime();
   g_flBFL_Setup[iThread] += (tSetupEnd - tSetupStart);
 
-  double tIllumAccum = 0;
-
   // sample the lights at each sample location
+  double tIllumStart = Plat_FloatTime();
   for (int grp = 0; grp < numGroups; ++grp) {
     int nSample = 4 * grp;
 
@@ -3479,10 +3499,8 @@ void BuildFacelights(int iThread, int facenum) {
     positions.LoadAndSwizzle(v[0], v[1], v[2], v[3]);
     normals.LoadAndSwizzle(n[0], n[1], n[2], n[3]);
 
-    double tIllumStart = Plat_FloatTime();
     ComputeIlluminationPointAndNormalsSSE(l, positions, normals, &sampleInfo,
                                           numSamples);
-    tIllumAccum += Plat_FloatTime() - tIllumStart;
 
     // Fixup sample normals in case of smooth faces
     if (!l.isflat) {
@@ -3497,20 +3515,19 @@ void BuildFacelights(int iThread, int facenum) {
       // GPU path: point/surface/spot lights handled by GPU kernel.
       // Sky lights (sun + ambient) evaluated here on CPU so the
       // supersampler can smooth them without GPU/CPU mismatch.
-      double tSkyStart = Plat_FloatTime();
       GatherSampleLight_CollectGPURays(sampleInfo, nSample, numSamples,
                                        iThread);
-      g_flBFL_SkyGather[iThread] += Plat_FloatTime() - tSkyStart;
     } else
 #endif
       GatherSampleLightAt4Points(sampleInfo, nSample, numSamples);
   }
+  double tIllumEnd = Plat_FloatTime();
+  g_flBFL_IllumNormals[iThread] += (tIllumEnd - tIllumStart);
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
   // GPU path: all lighting is computed by GPU direct lighting kernel.
   // Only setup + illum normals were needed from the CPU side.
   if (g_bUseGPU) {
-    g_flBFL_IllumNormals[iThread] += tIllumAccum;
     g_nBFL_FacesProcessed[iThread]++;
     return;
   }

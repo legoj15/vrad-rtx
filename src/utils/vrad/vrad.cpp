@@ -1168,16 +1168,6 @@ void MakeScales(int ndxPatch, transfer_t *all_transfers) {
       t->transfer = t2->transfer * total;
       t->patch = t2->patch;
     }
-    if (patch->numtransfers > max_transfer) {
-      int old_max = max_transfer;
-      while (patch->numtransfers > old_max) {
-        int prev = ThreadInterlockedCompareExchange(
-            (int32 volatile *)&max_transfer, patch->numtransfers, old_max);
-        if (prev == old_max)
-          break;
-        old_max = prev;
-      }
-    }
   } else {
     // Error - patch has no transfers
     // patch->totallight[2] = 255;
@@ -1806,6 +1796,18 @@ void BounceLight(void) {
   i = 0;
   double totalCollectTime = 0;
   double totalUnpackTime = 0;
+
+#ifdef VRAD_RTX_CUDA_SUPPORT
+  // Pre-allocate GPU bounce buffers outside the loop to avoid
+  // per-bounce malloc/free churn (~22 bounces × 2 buffers × ~3MB each).
+  float *gpuAddlight = nullptr;
+  float *gpuAddlightBump = nullptr;
+  if (g_bBounceGPU) {
+    gpuAddlight = (float *)malloc(uiPatchCount * 3 * sizeof(float));
+    gpuAddlightBump = (float *)malloc(uiPatchCount * 3 * 3 * sizeof(float));
+  }
+#endif
+
   while (bouncing) {
     // transfer light from to the leaf patches from other patches via transfers
     // this moves shooter->emitlight to receiver->addlight
@@ -1817,10 +1819,6 @@ void BounceLight(void) {
       // GPU path: dispatch GatherLight on GPU
       // emitlight is CUtlVector<Vector> = contiguous float[numPatches*3]
       // addlight is CUtlVector<bumplights_t> = contiguous array
-      float *gpuAddlight = (float *)malloc(uiPatchCount * 3 * sizeof(float));
-      float *gpuAddlightBump =
-          (float *)malloc(uiPatchCount * 3 * 3 * sizeof(float));
-
       RayTraceOptiX::GatherLightGPU((const float *)emitlight.Base(),
                                     gpuAddlight, gpuAddlightBump);
 
@@ -1843,9 +1841,6 @@ void BounceLight(void) {
           }
         }
       }
-
-      free(gpuAddlight);
-      free(gpuAddlightBump);
 
       totalUnpackTime += Plat_FloatTime() - startUnpack;
     } else
@@ -1878,6 +1873,8 @@ void BounceLight(void) {
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
   if (g_bBounceGPU) {
+    free(gpuAddlight);
+    free(gpuAddlightBump);
     RayTraceOptiX::PrintBounceProfile();
     Msg("  Unpack (CPU):   %6.1f ms\n", totalUnpackTime * 1000.0);
   }
@@ -1958,12 +1955,14 @@ void RadWorld_Start() {
 
   // turn each face into a single patch
   MakePatches();
+  AllocateEdgeshare();
   PairEdges();
 
   // store the vertex normals calculated in PairEdges
   // so that the can be written to the bsp file for
   // use in the engine
   SaveVertexNormals();
+  FreeEdgeshare(); // ~7 MB reclaimed after setup
 
   // subdivide patches to a maximum dimension
   SubdividePatches();
