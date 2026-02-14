@@ -46,8 +46,25 @@ static FILETIME s_ftLastUserTime = {};
 
 // Peak tracking
 static size_t s_nPeakRAM_MB = 0;
+static size_t s_nPeakWorkingSet_MB = 0;
 static size_t s_nPeakVRAMUsed_MB = 0;
 static float s_flPeakCPU = 0.0f;
+
+//-----------------------------------------------------------------------------
+// GPU Host Memory Tracker — per-category ledger
+//-----------------------------------------------------------------------------
+static const int MAX_HOSTMEM_CATEGORIES = 32;
+
+struct HostMemCategory {
+  const char *name;           // Category name (static string, not owned)
+  volatile long long current; // Current allocated bytes
+  volatile long long peak;    // Peak allocated bytes
+};
+
+static HostMemCategory s_hostMemCategories[MAX_HOSTMEM_CATEGORIES];
+static volatile long s_numHostMemCategories = 0;
+static volatile long long s_hostMemTotalCurrent = 0;
+static volatile long long s_hostMemTotalPeak = 0;
 
 // NVML function pointers (dynamically loaded)
 typedef int (*nvmlInit_t)(void);
@@ -68,14 +85,18 @@ static void *s_nvmlDevice = NULL;
 //-----------------------------------------------------------------------------
 // Helpers
 //-----------------------------------------------------------------------------
-static size_t GetProcessRAM_MB() {
+static size_t GetProcessRAM_MB(size_t *pPeakMB = nullptr) {
 #ifdef _WIN32
   HWP_PROCESS_MEMORY_COUNTERS pmc = {};
   pmc.cb = sizeof(pmc);
   if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+    if (pPeakMB)
+      *pPeakMB = pmc.PeakWorkingSetSize / (1024 * 1024);
     return pmc.WorkingSetSize / (1024 * 1024);
   }
 #endif
+  if (pPeakMB)
+    *pPeakMB = 0;
   return 0;
 }
 
@@ -223,7 +244,9 @@ void HardwareProfile_Init() {
   s_flInitTime = Plat_FloatTime();
   s_flLastSnapshotTime = s_flInitTime;
   s_nPeakRAM_MB = 0;
+  s_nPeakWorkingSet_MB = 0;
   s_nPeakVRAMUsed_MB = 0;
+  GPUHostMem_Reset();
   s_flPeakCPU = 0.0f;
 
 #ifdef _WIN32
@@ -240,10 +263,13 @@ void HardwareProfile_Init() {
 }
 
 void HardwareProfile_Snapshot(const char *pszLabel) {
-  // --- System RAM ---
-  size_t ramMB = GetProcessRAM_MB();
+  // --- System RAM (current + OS peak) ---
+  size_t peakWorkingSetMB = 0;
+  size_t ramMB = GetProcessRAM_MB(&peakWorkingSetMB);
   if (ramMB > s_nPeakRAM_MB)
     s_nPeakRAM_MB = ramMB;
+  if (peakWorkingSetMB > s_nPeakWorkingSet_MB)
+    s_nPeakWorkingSet_MB = peakWorkingSetMB;
 
   // --- VRAM ---
   size_t vramFreeMB = 0, vramTotalMB = 0;
@@ -271,7 +297,8 @@ void HardwareProfile_Snapshot(const char *pszLabel) {
 
   // --- Print ---
   Msg("[HW Profile] %s:\n", pszLabel);
-  Msg("  System RAM:  %zu MB (Peak: %zu MB)\n", ramMB, s_nPeakRAM_MB);
+  Msg("  System RAM:  %zu MB (Peak: %zu MB, OS Peak: %zu MB)\n", ramMB,
+      s_nPeakRAM_MB, peakWorkingSetMB);
 
   if (bHasVRAM) {
     float vramPct = vramTotalMB > 0
@@ -292,26 +319,137 @@ void HardwareProfile_Snapshot(const char *pszLabel) {
     Msg("  GPU Usage:   %.1f%%\n", gpuUsage);
   else
     Msg("  GPU Usage:   N/A (NVML not available)\n");
+
+  // --- GPU Host Memory Breakdown ---
+  GPUHostMem_Print();
 }
 
 void HardwareProfile_PrintSummary() {
   Msg("\nHardware Usage Summary:\n");
   Msg("----------------------\n");
-  Msg("Peak System RAM: %zu MB\n", s_nPeakRAM_MB);
+  Msg("Peak System RAM:       %zu MB (sampled)\n", s_nPeakRAM_MB);
+  Msg("Peak Working Set (OS): %zu MB (true high-water mark)\n",
+      s_nPeakWorkingSet_MB);
+
+  // GPU host memory peak
+  long long hostMemPeakBytes = s_hostMemTotalPeak;
+  if (hostMemPeakBytes > 0) {
+    Msg("Peak GPU Host Mem:     %lld MB (tracked)\n",
+        hostMemPeakBytes / (1024LL * 1024LL));
+  }
 
   if (s_nPeakVRAMUsed_MB > 0)
-    Msg("Peak GPU VRAM:   %zu MB\n", s_nPeakVRAMUsed_MB);
+    Msg("Peak GPU VRAM:         %zu MB\n", s_nPeakVRAMUsed_MB);
   else
-    Msg("Peak GPU VRAM:   N/A\n");
+    Msg("Peak GPU VRAM:         N/A\n");
 
   if (s_flPeakCPU > 0.0f)
-    Msg("Peak CPU Usage:  %.1f%%\n", s_flPeakCPU);
+    Msg("Peak CPU Usage:        %.1f%%\n", s_flPeakCPU);
   else
-    Msg("Peak CPU Usage:  N/A\n");
+    Msg("Peak CPU Usage:        N/A\n");
 
   Msg("----------------------\n");
 
   ShutdownNVML();
+}
+
+//-----------------------------------------------------------------------------
+// GPU Host Memory Tracker — Implementation
+//-----------------------------------------------------------------------------
+
+// Find or create a category slot. Returns index, or -1 if full.
+static int FindOrCreateCategory(const char *name) {
+  // First, look for existing
+  long count = s_numHostMemCategories;
+  for (long i = 0; i < count; i++) {
+    if (s_hostMemCategories[i].name == name) // pointer compare (static strings)
+      return (int)i;
+  }
+
+  // Not found — create a new slot (interlocked to avoid races)
+  long idx = InterlockedIncrement(&s_numHostMemCategories) - 1;
+  if (idx >= MAX_HOSTMEM_CATEGORIES) {
+    // Out of slots — decrement back and return -1
+    InterlockedDecrement(&s_numHostMemCategories);
+    return -1;
+  }
+  s_hostMemCategories[idx].name = name;
+  s_hostMemCategories[idx].current = 0;
+  s_hostMemCategories[idx].peak = 0;
+  return (int)idx;
+}
+
+void GPUHostMem_Track(const char *category, long long deltaBytes) {
+  if (deltaBytes == 0)
+    return;
+
+  int idx = FindOrCreateCategory(category);
+  if (idx < 0)
+    return;
+
+  HostMemCategory &cat = s_hostMemCategories[idx];
+
+  // Interlocked add to current
+  long long newVal =
+      InterlockedExchangeAdd64(&cat.current, deltaBytes) + deltaBytes;
+
+  // Update peak if new high
+  long long oldPeak = cat.peak;
+  while (newVal > oldPeak) {
+    long long prev = InterlockedCompareExchange64(&cat.peak, newVal, oldPeak);
+    if (prev == oldPeak)
+      break;
+    oldPeak = prev;
+  }
+
+  // Update global total
+  long long newTotal =
+      InterlockedExchangeAdd64(&s_hostMemTotalCurrent, deltaBytes) + deltaBytes;
+
+  long long oldTotalPeak = s_hostMemTotalPeak;
+  while (newTotal > oldTotalPeak) {
+    long long prev = InterlockedCompareExchange64(&s_hostMemTotalPeak, newTotal,
+                                                  oldTotalPeak);
+    if (prev == oldTotalPeak)
+      break;
+    oldTotalPeak = prev;
+  }
+}
+
+void GPUHostMem_Print() {
+  long count = s_numHostMemCategories;
+  if (count <= 0)
+    return;
+
+  Msg("  GPU Host Memory Breakdown:\n");
+  long long totalCurrent = 0;
+  long long totalPeak = 0;
+  for (long i = 0; i < count; i++) {
+    const HostMemCategory &cat = s_hostMemCategories[i];
+    long long cur = cat.current;
+    long long pk = cat.peak;
+    totalCurrent += cur;
+    totalPeak += pk;
+
+    // Only show categories that have had allocations
+    if (pk > 0) {
+      Msg("    %-28s %6lld MB  (peak: %lld MB)\n", cat.name,
+          cur / (1024LL * 1024LL), pk / (1024LL * 1024LL));
+    }
+  }
+  Msg("    %-28s %6lld MB  (peak: %lld MB)\n", "TOTAL TRACKED",
+      totalCurrent / (1024LL * 1024LL), totalPeak / (1024LL * 1024LL));
+}
+
+void GPUHostMem_Reset() {
+  for (int i = 0; i < MAX_HOSTMEM_CATEGORIES; i++) {
+    s_hostMemCategories[i].name = nullptr;
+    s_hostMemCategories[i].current = 0;
+    s_hostMemCategories[i].peak = 0;
+  }
+  s_numHostMemCategories = 0;
+  s_hostMemTotalCurrent = 0;
+  s_hostMemTotalPeak = 0;
 }
 
 //-----------------------------------------------------------------------------

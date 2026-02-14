@@ -72,10 +72,12 @@ struct facelight_t {
                          1]; // result of direct illumination, indexed by sample
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
-  // Per-sample GPU point/surface/spot light contribution, stored separately
-  // so the supersampler can subtract it before gradient detection and add
-  // it back after. Sky lights are CPU-evaluated and flow through SS normally.
-  LightingValue_t *gpu_point[NUM_BUMP_VECTS + 1];
+  // GPU point light contributions stored separately for subtract/restore.
+  // Before gradient detection, gpu_point[] is subtracted from fl.light[];
+  // after supersampling, it is restored. This lets the supersampler skip
+  // re-evaluating point lights (CPU handles only sky at sub-positions),
+  // saving ~7 seconds.
+  LightingValue_t *gpu_point[MAXLIGHTMAPS][NUM_BUMP_VECTS + 1];
 #endif
 
   // regularly spaced lightmap grid

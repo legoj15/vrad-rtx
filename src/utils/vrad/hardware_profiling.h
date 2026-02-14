@@ -19,4 +19,22 @@ void HardwareProfile_PrintSummary();
 // numThreads = worker thread count for BuildFacelights.
 int AutoComputeGPURayBatchSize(int numThreads);
 
+//-----------------------------------------------------------------------------
+// GPU Host Memory Tracking
+//
+// Lightweight per-category ledger for tracking host-side memory allocations
+// made by the GPU pipeline. Call Track() on alloc (+bytes) and free (-bytes).
+// Thread-safe via interlocked operations.
+//-----------------------------------------------------------------------------
+
+// Track a host memory allocation or free for a named category.
+// deltaBytes > 0 for allocation, < 0 for free.
+void GPUHostMem_Track(const char *category, long long deltaBytes);
+
+// Print all tracked categories with current and peak usage.
+void GPUHostMem_Print();
+
+// Reset all tracking to zero.
+void GPUHostMem_Reset();
+
 #endif // HARDWARE_PROFILING_H

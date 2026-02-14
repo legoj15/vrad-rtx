@@ -11,6 +11,7 @@
 #ifdef VRAD_RTX_CUDA_SUPPORT
 
 #include "direct_lighting_gpu.h"
+#include "hardware_profiling.h"
 #include "lightmap.h"
 #include "mathlib/bumpvects.h"
 #include "raytrace_optix.h"
@@ -222,6 +223,9 @@ void BuildGPUSceneData() {
   // --- Allocate host buffers ---
   GPUSampleData *hostSamples = new GPUSampleData[totalSamples];
   GPUFaceInfo *hostFaceInfos = new GPUFaceInfo[numfaces];
+  GPUHostMem_Track("GPUSampleData",
+                   (long long)totalSamples * sizeof(GPUSampleData));
+  GPUHostMem_Track("GPUFaceInfo", (long long)numfaces * sizeof(GPUFaceInfo));
 
   // --- Pass 2: fill sample + face info arrays ---
   int sampleCursor = 0;
@@ -308,10 +312,14 @@ void BuildGPUSceneData() {
 
   if (numClusters > 0 && g_nClusterLights && g_ClusterLightOffsets) {
     hostClusterLists = new GPUClusterLightList[numClusters];
+    GPUHostMem_Track("GPUClusterLightList",
+                     (long long)numClusters * sizeof(GPUClusterLightList));
 
     // Count total entries
     numClusterLightEntries = g_nTotalClusterLightEntries;
     hostClusterLightIndices = new int[numClusterLightEntries];
+    GPUHostMem_Track("ClusterLightIndices",
+                     (long long)numClusterLightEntries * sizeof(int));
 
     // Walk the existing CSR-style per-cluster light arrays, converting
     // directlight_t* pointers to integer indices.
@@ -349,8 +357,19 @@ void BuildGPUSceneData() {
       numLightsTotal, numClusters, numClusterLightEntries);
 
   // --- Cleanup host buffers ---
+  GPUHostMem_Track("GPUSampleData",
+                   -(long long)totalSamples * sizeof(GPUSampleData));
+  GPUHostMem_Track("GPUFaceInfo", -(long long)numfaces * sizeof(GPUFaceInfo));
   delete[] hostSamples;
   delete[] hostFaceInfos;
+  if (hostClusterLists) {
+    GPUHostMem_Track("GPUClusterLightList",
+                     -(long long)numClusters * sizeof(GPUClusterLightList));
+  }
+  if (hostClusterLightIndices) {
+    GPUHostMem_Track("ClusterLightIndices",
+                     -(long long)numClusterLightEntries * sizeof(int));
+  }
   delete[] hostClusterLists;
   delete[] hostClusterLightIndices;
 }
@@ -399,6 +418,8 @@ void DownloadAndApplyGPUResults() {
 
   // Download the GPU output buffer to host
   GPULightOutput *hostOutput = new GPULightOutput[numSamples];
+  GPUHostMem_Track("GPULightOutput",
+                   (long long)numSamples * sizeof(GPULightOutput));
   DownloadDirectLightingOutput(hostOutput, numSamples);
 
   // We also need the face info array to know which samples belong to which face
@@ -423,13 +444,20 @@ void DownloadAndApplyGPUResults() {
             : 1;
 
     // Allocate gpu_point[] to store GPU point light contributions separately.
-    // These are subtracted before gradient detection and added back after SS.
-    for (int n = 0; n < normalCount; n++) {
-      fl.gpu_point[n] = new LightingValue_t[fl.numsamples];
-      memset(fl.gpu_point[n], 0, fl.numsamples * sizeof(LightingValue_t));
+    // These are subtracted before gradient detection and restored after SS.
+    for (int style = 0; style < MAXLIGHTMAPS; style++) {
+      for (int n = 0; n < NUM_BUMP_VECTS + 1; n++) {
+        if (fl.light[style][n]) {
+          fl.gpu_point[style][n] = new LightingValue_t[fl.numsamples];
+          memset(fl.gpu_point[style][n], 0,
+                 fl.numsamples * sizeof(LightingValue_t));
+          GPUHostMem_Track("gpu_point",
+                           (long long)fl.numsamples * sizeof(LightingValue_t));
+        } else {
+          fl.gpu_point[style][n] = nullptr;
+        }
+      }
     }
-    for (int n = normalCount; n < NUM_BUMP_VECTS + 1; n++)
-      fl.gpu_point[n] = nullptr;
 
     for (int s = 0; s < fl.numsamples; s++) {
       if (sampleCursor >= numSamples)
@@ -441,7 +469,6 @@ void DownloadAndApplyGPUResults() {
       totalR += out.r[0];
       totalG += out.g[0];
       totalB += out.b[0];
-      totalSun += out.sunAmount;
       float totalSampleR = out.r[0];
       float totalSampleG = out.g[0];
       float totalSampleB = out.b[0];
@@ -456,18 +483,17 @@ void DownloadAndApplyGPUResults() {
       else
         nonzeroSamples++;
 
-      // Apply per-bump-vector GPU results to lightstyle 0 AND store
-      // separately in gpu_point[] for subtract/restore during SS.
+      // Apply per-bump-vector GPU point light results to lightstyle 0.
+      // Also store in gpu_point[] for subtract/restore.
       for (int n = 0; n < normalCount; n++) {
         if (fl.light[0][n]) {
           fl.light[0][n][s].m_vecLighting.x += out.r[n];
           fl.light[0][n][s].m_vecLighting.y += out.g[n];
           fl.light[0][n][s].m_vecLighting.z += out.b[n];
-        }
-        if (fl.gpu_point[n]) {
-          fl.gpu_point[n][s].m_vecLighting.x = out.r[n];
-          fl.gpu_point[n][s].m_vecLighting.y = out.g[n];
-          fl.gpu_point[n][s].m_vecLighting.z = out.b[n];
+
+          fl.gpu_point[0][n][s].m_vecLighting.x = out.r[n];
+          fl.gpu_point[0][n][s].m_vecLighting.y = out.g[n];
+          fl.gpu_point[0][n][s].m_vecLighting.z = out.b[n];
         }
       }
       applied++;
@@ -486,6 +512,8 @@ void DownloadAndApplyGPUResults() {
       numSamples > 0 ? 100.0 * zeroSamples / numSamples : 0.0);
   Msg("    Max sample: R=%.3f G=%.3f B=%.3f\n", maxR, maxG, maxB);
 
+  GPUHostMem_Track("GPULightOutput",
+                   -(long long)numSamples * sizeof(GPULightOutput));
   delete[] hostOutput;
 }
 

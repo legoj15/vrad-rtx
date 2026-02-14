@@ -1629,6 +1629,16 @@ static void BuildBounceCSR_GPU(void) {
   int *needsBumpmap = (int *)malloc(numPatches * sizeof(int));
   int *faceNumber = (int *)malloc(numPatches * sizeof(int));
 
+  // Track all CSR host allocations
+  long long csrHostBytes =
+      (long long)(numPatches + 1) * sizeof(int) + // csrOffsets
+      (long long)totalTrans * sizeof(int) +       // csrPatch
+      (long long)totalTrans * sizeof(float) +     // csrWeight
+      (long long)numPatches * 3 * sizeof(float) *
+          3 +                                  // reflectivity+origin+normal
+      (long long)numPatches * sizeof(int) * 2; // needsBumpmap+faceNumber
+  GPUHostMem_Track("CSR arrays", csrHostBytes);
+
   // Count bump patches for bump normal array
   int numBumpPatches = 0;
 
@@ -1666,8 +1676,11 @@ static void BuildBounceCSR_GPU(void) {
 
   // Precompute bump normals (4 normals per patch: flat + 3 bump)
   float *bumpNormals = nullptr;
+  long long bumpNormalBytes = 0;
   if (numBumpPatches > 0) {
+    bumpNormalBytes = (long long)numPatches * 4 * 3 * sizeof(float);
     bumpNormals = (float *)calloc(numPatches * 4 * 3, sizeof(float));
+    GPUHostMem_Track("Bump normals", bumpNormalBytes);
 
     for (unsigned int i = 0; i < numPatches; i++) {
       CPatch *patch = &g_Patches[i];
@@ -1718,6 +1731,7 @@ static void BuildBounceCSR_GPU(void) {
       numBumpPatches);
 
   // Free host CSR arrays (data is now on GPU)
+  GPUHostMem_Track("CSR arrays", -csrHostBytes);
   free(csrOffsets);
   free(csrPatch);
   free(csrWeight);
@@ -1726,8 +1740,10 @@ static void BuildBounceCSR_GPU(void) {
   free(patchNormal);
   free(needsBumpmap);
   free(faceNumber);
-  if (bumpNormals)
+  if (bumpNormals) {
+    GPUHostMem_Track("Bump normals", -bumpNormalBytes);
     free(bumpNormals);
+  }
 }
 #endif // VRAD_RTX_CUDA_SUPPORT
 
@@ -2184,6 +2200,8 @@ bool RadWorld_Go() {
         sceneDataUploadTime = Plat_FloatTime() - uploadStart;
       }
 
+      HardwareProfile_Snapshot("After GPU Scene Upload");
+
       // GPU direct lighting kernel:
       // Computes emit_point/surface/spotlight contributions on GPU with
       // inline shadow tracing. Results added to facelight[].light[0][].
@@ -2321,6 +2339,9 @@ bool RadWorld_Go() {
       memset(emitlight.Base(), 0, g_Patches.Size() * sizeof(Vector));
       addlight.SetSize(g_Patches.Size());
       memset(addlight.Base(), 0, g_Patches.Size() * sizeof(bumplights_t));
+      GPUHostMem_Track("emitlight+addlight",
+                       (long long)g_Patches.Size() *
+                           (sizeof(Vector) + sizeof(bumplights_t)));
 
       MakeAllScales();
       HardwareProfile_Snapshot("After Visibility Matrix");
@@ -2550,6 +2571,11 @@ void VRAD_LoadBSP(char const *pFilename) {
     start = Plat_FloatTime();
 
     if (RayTraceOptiX::Initialize()) {
+      // Track pinned host memory allocated by OptiX (2 ping-pong buffers)
+      // RayBatch=36B, RayResult=20B, maxBatch=1M, 2 buffers
+      GPUHostMem_Track("OptiX pinned host",
+                       2LL * 1000000 * (sizeof(RayBatch) + sizeof(RayResult)));
+
       // Upload scene geometry to GPU
       RayTraceOptiX::BuildScene(
           g_RtEnv.OptimizedTriangleList, g_RtEnv.OptimizedKDTree,
@@ -2638,6 +2664,9 @@ void VRAD_Finish() {
 #ifdef VRAD_RTX_CUDA_SUPPORT
   // Shutdown GPU ray tracing
   if (g_bUseGPU) {
+    GPUHostMem_Track(
+        "OptiX pinned host",
+        -(long long)(2LL * 1000000 * (sizeof(RayBatch) + sizeof(RayResult))));
     RayTraceOptiX::Shutdown();
   }
 #endif

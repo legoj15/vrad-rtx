@@ -364,7 +364,7 @@ if ($tgaArgs.Count -gt 0) {
 }
 
 $timestamp = (Get-Date).ToString("yyyy-MM-ddTHH-mm-ss")
-$RUN_DIR = "$ARCHIVE_DIR\$timestamp"
+$RUN_DIR = "$ARCHIVE_DIR\${timestamp}_radiosity"
 New-Item -ItemType Directory -Path $RUN_DIR | Out-Null
 
 $logMap = @{

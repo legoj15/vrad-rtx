@@ -358,13 +358,14 @@ __forceinline__ __device__ float TraceShadowRay(float3 origin, float3 direction,
   unsigned int p2 = 0, p3 = 0, p4 = 0;
   unsigned int p5 = (unsigned int)-1; // No skip ID for shadow rays
 
-  optixTrace(params.traversable, origin, direction,
-             1e-3f, // tmin: larger than 1e-4 to avoid self-shadow artifacts
-             tmax,  // tmax: distance to light
-             0.0f,  // rayTime
-             OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1,
-             0, // SBT offset, stride, miss index
-             p0, p1, p2, p3, p4, p5);
+  optixTrace(
+      params.traversable, origin, direction,
+      1e-3f, // tmin: avoid self-shadow artifacts (tested: 1e-4 worsened parity)
+      tmax,  // tmax: distance to light
+      0.0f,  // rayTime
+      OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1,
+      0, // SBT offset, stride, miss index
+      p0, p1, p2, p3, p4, p5);
 
   // Miss (hit_id == -1) means visible
   return ((int)p1 == -1) ? 1.0f : 0.0f;
@@ -456,17 +457,8 @@ extern "C" __global__ void __raygen__direct_lighting() {
   float accumG[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   float accumB[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  // Separate sun accumulators — written to sun_r/g/b output channels
-  // so the host can subtract them before gradient detection.
-  float sunAccumR[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  float sunAccumG[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  float sunAccumB[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-  // Separate ambient sky accumulators — written to sky_r/g/b output channels.
-  // Ambient sky is spatially smooth and doesn't need SS smoothing.
-  float skyAccumR[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  float skyAccumG[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  float skyAccumB[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  // Separate sun/sky accumulators removed — CPU evaluates sky now.
+  // Only point/surface/spot lights are accumulated on GPU.
 
   // Iterate over all lights visible from this cluster
   for (int li = 0; li < lightCount; li++) {
@@ -477,217 +469,11 @@ extern "C" __global__ void __raygen__direct_lighting() {
     const GPULight &light = params.d_lights[lightIdx];
 
     // ---------------------------------------------------------------
-    // Sky light types — write to separate sky accumulators
+    // Sky light types — CPU handles sun and ambient sky evaluation.
+    // Skip entirely on GPU to save compute time and VRAM.
     // ---------------------------------------------------------------
-    if (light.type == EMIT_SKYLIGHT) {
-      // Sun light: trace ray along -light.normal toward sky
-      float3 lightNormal =
-          make_float3(light.normal_x, light.normal_y, light.normal_z);
-
-      // N·L = -dot(sampleNormal, lightNormal) = dot(sampleNormal, -lightNormal)
-      float skyDot =
-          -(sampleNormal.x * lightNormal.x + sampleNormal.y * lightNormal.y +
-            sampleNormal.z * lightNormal.z);
-      if (skyDot <= 0.0f)
-        continue;
-
-      // MAX_TRACE_LENGTH = 1.732050807569 * 2 * 65536 = ~56755.84
-      const float GPU_MAX_TRACE_LENGTH = 56755.84f;
-
-      // --- Sub-luxel sun shadow anti-aliasing ---
-      // Trace multiple rays from jittered positions within the luxel
-      // footprint to produce smooth shadow edges without CPU mixing.
-      int nPosSamples =
-          (params.sunShadowSamples > 0) ? params.sunShadowSamples : 1;
-      float jitterRadius = params.sunShadowRadius;
-
-      // Compute tangent frame from sample normal for position jittering
-      float3 tangentU, tangentV;
-      if (jitterRadius > 0.0f && nPosSamples > 1) {
-        // Choose a non-parallel axis to cross with normal
-        float3 up = (fabsf(sampleNormal.z) < 0.9f)
-                        ? make_float3(0.0f, 0.0f, 1.0f)
-                        : make_float3(1.0f, 0.0f, 0.0f);
-        // tangentU = normalize(cross(up, normal))
-        tangentU.x = up.y * sampleNormal.z - up.z * sampleNormal.y;
-        tangentU.y = up.z * sampleNormal.x - up.x * sampleNormal.z;
-        tangentU.z = up.x * sampleNormal.y - up.y * sampleNormal.x;
-        float tLen = sqrtf(tangentU.x * tangentU.x + tangentU.y * tangentU.y +
-                           tangentU.z * tangentU.z);
-        if (tLen > 1e-6f) {
-          float inv = 1.0f / tLen;
-          tangentU.x *= inv;
-          tangentU.y *= inv;
-          tangentU.z *= inv;
-        }
-        // tangentV = cross(normal, tangentU)
-        tangentV.x = sampleNormal.y * tangentU.z - sampleNormal.z * tangentU.y;
-        tangentV.y = sampleNormal.z * tangentU.x - sampleNormal.x * tangentU.z;
-        tangentV.z = sampleNormal.x * tangentU.y - sampleNormal.y * tangentU.x;
-      } else {
-        tangentU = make_float3(0, 0, 0);
-        tangentV = make_float3(0, 0, 0);
-      }
-
-      // Direction jitter samples (for area sun with angular extent)
-      int nDirSamples = 1;
-      if (params.numSunSamples > 0 && params.sunAngularExtent > 0.0f)
-        nDirSamples = params.numSunSamples;
-
-      float totalVis = 0.0f;
-      int totalTraces = 0;
-
-      for (int pi = 0; pi < nPosSamples; pi++) {
-        // Compute jittered position along tangent plane
-        float3 tracePos = samplePos;
-        if (jitterRadius > 0.0f && nPosSamples > 1) {
-          // Stratified 2D jitter via hash
-          unsigned int seed = (unsigned int)(sampleIdx * 127 + pi * 31);
-          seed = seed * 1103515245u + 12345u;
-          float ju = ((seed >> 16) & 0x7FFF) / 32767.0f - 0.5f;
-          seed = seed * 1103515245u + 12345u;
-          float jv = ((seed >> 16) & 0x7FFF) / 32767.0f - 0.5f;
-
-          tracePos.x += (ju * tangentU.x + jv * tangentV.x) * jitterRadius;
-          tracePos.y += (ju * tangentU.y + jv * tangentV.y) * jitterRadius;
-          tracePos.z += (ju * tangentU.z + jv * tangentV.z) * jitterRadius;
-        }
-
-        for (int di = 0; di < nDirSamples; di++) {
-          // Base direction toward sky: -lightNormal
-          float3 skyDir =
-              make_float3(-lightNormal.x, -lightNormal.y, -lightNormal.z);
-
-          if (di > 0 && params.sunAngularExtent > 0.0f) {
-            // Area sun direction jitter
-            unsigned int seed =
-                (unsigned int)(sampleIdx * 31 + pi * 97 + di * 7);
-            seed = seed * 1103515245u + 12345u;
-            float jx = ((seed >> 16) & 0x7FFF) / 32767.0f - 0.5f;
-            seed = seed * 1103515245u + 12345u;
-            float jy = ((seed >> 16) & 0x7FFF) / 32767.0f - 0.5f;
-            seed = seed * 1103515245u + 12345u;
-            float jz = ((seed >> 16) & 0x7FFF) / 32767.0f - 0.5f;
-
-            skyDir.x += jx * params.sunAngularExtent;
-            skyDir.y += jy * params.sunAngularExtent;
-            skyDir.z += jz * params.sunAngularExtent;
-          }
-
-          // Normalize direction
-          float dirLen = sqrtf(skyDir.x * skyDir.x + skyDir.y * skyDir.y +
-                               skyDir.z * skyDir.z);
-          if (dirLen < 1e-6f)
-            continue;
-          float invLen = 1.0f / dirLen;
-          skyDir.x *= invLen;
-          skyDir.y *= invLen;
-          skyDir.z *= invLen;
-
-          totalVis += TraceSkyRay(tracePos, skyDir, GPU_MAX_TRACE_LENGTH);
-          totalTraces++;
-        }
-      }
-
-      if (totalTraces <= 0)
-        continue;
-      float seeAmount = totalVis / (float)totalTraces;
-      if (seeAmount <= 0.0f)
-        continue;
-
-      // Sun goes to separate accumulators (sun_r/g/b channels) so the
-      // host can subtract it before gradient detection and add it back
-      // uniformly, preventing GPU/CPU sun mismatch cascade.
-      float scale = skyDot * seeAmount;
-      sunAccumR[0] += scale * light.intensity_x;
-      sunAccumG[0] += scale * light.intensity_y;
-      sunAccumB[0] += scale * light.intensity_z;
-
-      // Per-bump contributions
-      for (int n = 1; n < normalCount; n++) {
-        float bDot = -(bumpNormals[n].x * lightNormal.x +
-                       bumpNormals[n].y * lightNormal.y +
-                       bumpNormals[n].z * lightNormal.z);
-        bDot = fmaxf(bDot, 0.0f);
-        float bScale = bDot * seeAmount;
-        sunAccumR[n] += bScale * light.intensity_x;
-        sunAccumG[n] += bScale * light.intensity_y;
-        sunAccumB[n] += bScale * light.intensity_z;
-      }
+    if (light.type == EMIT_SKYLIGHT || light.type == EMIT_SKYAMBIENT)
       continue;
-    }
-
-    if (light.type == EMIT_SKYAMBIENT) {
-      // Ambient sky: hemisphere Monte Carlo sampling
-      // Use precomputed directions from launch params
-      if (params.numSkyDirs <= 0 || params.d_skyDirs == nullptr)
-        continue;
-
-      const float GPU_MAX_TRACE_LENGTH = 56755.84f;
-      const float EPSILON_DOT = 1e-5f;
-
-      float ambientR[4] = {0, 0, 0, 0};
-      float ambientG[4] = {0, 0, 0, 0};
-      float ambientB[4] = {0, 0, 0, 0};
-      float sumdot = 0.0f;
-      float possibleHitCount0 = 0.0f;
-      float possibleHitCountN[4] = {0, 0, 0, 0};
-
-      for (int j = 0; j < params.numSkyDirs; j++) {
-        float3 anorm = params.d_skyDirs[j];
-
-        // dot = -dot(sampleNormal, anorm) — same as CPU
-        float dotN = -(sampleNormal.x * anorm.x + sampleNormal.y * anorm.y +
-                       sampleNormal.z * anorm.z);
-
-        if (dotN <= EPSILON_DOT)
-          continue;
-
-        sumdot += dotN;
-        possibleHitCount0 += 1.0f;
-
-        // Trace sky ray in direction -anorm (toward sky)
-        float3 skyDir = make_float3(-anorm.x, -anorm.y, -anorm.z);
-        float vis = TraceSkyRay(samplePos, skyDir, GPU_MAX_TRACE_LENGTH);
-
-        ambientR[0] += vis * dotN;
-        ambientG[0] += vis * dotN;
-        ambientB[0] += vis * dotN;
-
-        for (int n = 1; n < normalCount; n++) {
-          float bDot =
-              -(bumpNormals[n].x * anorm.x + bumpNormals[n].y * anorm.y +
-                bumpNormals[n].z * anorm.z);
-          if (bDot > EPSILON_DOT) {
-            possibleHitCountN[n] += 1.0f;
-            ambientR[n] += vis * bDot;
-            ambientG[n] += vis * bDot;
-            ambientB[n] += vis * bDot;
-          }
-        }
-      }
-
-      // Normalize — replicate CPU's normalization logic → sky accumulators
-      if (sumdot > 0.0f && possibleHitCount0 > 0.0f) {
-        // Channel 0: ambient_intensity[0] / sumdot
-        float normFactor0 = 1.0f / sumdot;
-        skyAccumR[0] += ambientR[0] * normFactor0 * light.intensity_x;
-        skyAccumG[0] += ambientG[0] * normFactor0 * light.intensity_y;
-        skyAccumB[0] += ambientB[0] * normFactor0 * light.intensity_z;
-
-        for (int n = 1; n < normalCount; n++) {
-          // Scale by possibleHitCount ratio, then normalize by sumdot
-          float factor = (possibleHitCountN[n] / possibleHitCount0) * sumdot;
-          if (factor > 0.0f) {
-            float normFactorN = 1.0f / factor;
-            skyAccumR[n] += ambientR[n] * normFactorN * light.intensity_x;
-            skyAccumG[n] += ambientG[n] * normFactorN * light.intensity_y;
-            skyAccumB[n] += ambientB[n] * normFactorN * light.intensity_z;
-          }
-        }
-      }
-      continue;
-    }
 
     // ---------------------------------------------------------------
     // Compute delta = lightOrigin - samplePos
@@ -880,17 +666,7 @@ extern "C" __global__ void __raygen__direct_lighting() {
       atomicAdd(&params.d_lightOutput[sampleIdx].g[n], accumG[n]);
       atomicAdd(&params.d_lightOutput[sampleIdx].b[n], accumB[n]);
     }
-    // Write sun contributions to separate output channels
-    if (sunAccumR[n] > 0.0f || sunAccumG[n] > 0.0f || sunAccumB[n] > 0.0f) {
-      atomicAdd(&params.d_lightOutput[sampleIdx].sun_r[n], sunAccumR[n]);
-      atomicAdd(&params.d_lightOutput[sampleIdx].sun_g[n], sunAccumG[n]);
-      atomicAdd(&params.d_lightOutput[sampleIdx].sun_b[n], sunAccumB[n]);
-    }
-    // Write ambient sky contributions to separate output channels
-    if (skyAccumR[n] > 0.0f || skyAccumG[n] > 0.0f || skyAccumB[n] > 0.0f) {
-      atomicAdd(&params.d_lightOutput[sampleIdx].sky_r[n], skyAccumR[n]);
-      atomicAdd(&params.d_lightOutput[sampleIdx].sky_g[n], skyAccumG[n]);
-      atomicAdd(&params.d_lightOutput[sampleIdx].sky_b[n], skyAccumB[n]);
-    }
+    // Only write point/surface/spot light results.
+    // Sun/sky removed — CPU handles those.
   }
 }

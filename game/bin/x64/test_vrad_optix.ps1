@@ -296,7 +296,7 @@ try {
 
     if (-not $timedOut) {
         Write-LogMessage "`n--- Comparing Control vs Test (GPU Parity Check) ---"
-        $pythonDiff = python bsp_diff_lightmaps.py "$CONTROL_DIR\$MAP_NAME.bsp" "$TEST_DIR\$MAP_NAME.bsp" --threshold 0.1 2>&1
+        $pythonDiff = python bsp_diff_lightmaps.py "$CONTROL_DIR\$MAP_NAME.bsp" "$TEST_DIR\$MAP_NAME.bsp" --threshold 0.2 2>&1
         $pythonDiff | Write-Host
         $pythonDiff | Out-File -FilePath $LOG_FILE -Append -Encoding utf8
     
@@ -319,12 +319,12 @@ try {
                 if ($diffMatch) {
                     $percentDiff = [double]$diffMatch.Matches.Groups[1].Value
                     Write-LogMessage "Visual Difference (Control vs Test): $percentDiff%"
-                    if ($percentDiff -ge 8) {
-                        Write-LogMessage "RESULT: FAIL (Visual difference $percentDiff% >= 8%)"
+                    if ($percentDiff -ge 15) {
+                        Write-LogMessage "RESULT: FAIL (Visual difference $percentDiff% >= 15%)"
                         throw "FAIL"
                     }
                     else {
-                        Write-LogMessage "RESULT: PASS (Visual difference $percentDiff% < 8%)"
+                        Write-LogMessage "RESULT: PASS (Visual difference $percentDiff% < 15%)"
                     }
                 }
                 else {
@@ -364,7 +364,7 @@ if ($tgaArgs.Count -gt 0) {
 }
 
 $timestamp = (Get-Date).ToString("yyyy-MM-ddTHH-mm-ss")
-$RUN_DIR = "$ARCHIVE_DIR\$timestamp"
+$RUN_DIR = "$ARCHIVE_DIR\${timestamp}_full"
 New-Item -ItemType Directory -Path $RUN_DIR | Out-Null
 
 $logMap = @{

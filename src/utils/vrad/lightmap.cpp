@@ -2807,12 +2807,12 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
     }
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
-    // GPU path: skip non-sky lights in supersampling. Point/surface/spot
-    // lights are from GPU kernel. Only sky lights are CPU-evaluated and
-    // need to be re-evaluated at sub-positions.
+    // GPU path: skip non-sky lights — GPU already evaluated point lights.
+    // Only sky lights need CPU evaluation at sub-positions.
     if (g_bUseGPU && dl->light.type != emit_skylight &&
-        dl->light.type != emit_skyambient)
+        dl->light.type != emit_skyambient) {
       continue;
+    }
 #endif
 
     if ((flags & AMBIENT_ONLY) && (dl->light.type != emit_skyambient))
@@ -3128,16 +3128,16 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
   LightingValue_t **ppLightSamples = info.m_pFaceLight->light[lightstyleIndex];
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
-  // GPU path: subtract GPU point light contributions before gradient
-  // detection. Point lights are from GPU kernel and differ subtly from
-  // CPU BSP tracing, which would trigger excess gradients. They are
-  // added back unchanged after the SS loop.
-  if (g_bUseGPU && lightstyleIndex == 0) {
-    for (int n = 0; n < info.m_NormalCount; ++n) {
-      if (info.m_pFaceLight->gpu_point[n]) {
-        for (int s = 0; s < info.m_pFaceLight->numsamples; ++s) {
-          ppLightSamples[n][s].m_vecLighting -=
-              info.m_pFaceLight->gpu_point[n][s].m_vecLighting;
+  // GPU path: subtract gpu_point[] before gradient detection so that
+  // point light energy doesn't trigger false gradients. This lets the
+  // supersampler evaluate only sky lights at sub-positions.
+  if (g_bUseGPU) {
+    for (int i = 0; i < info.m_pFaceLight->numsamples; ++i) {
+      for (int n = 0; n < info.m_NormalCount; ++n) {
+        if (ppLightSamples[n] &&
+            info.m_pFaceLight->gpu_point[lightstyleIndex][n]) {
+          ppLightSamples[n][i].m_vecLighting -=
+              info.m_pFaceLight->gpu_point[lightstyleIndex][n][i].m_vecLighting;
         }
       }
     }
@@ -3243,15 +3243,16 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
   }
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
-  // GPU path: add back GPU point light contributions (unfiltered) to all
-  // samples. They were subtracted before gradient detection to prevent
-  // excess gradients from GPU/CPU tracing differences.
-  if (g_bUseGPU && lightstyleIndex == 0) {
-    for (int n = 0; n < info.m_NormalCount; ++n) {
-      if (info.m_pFaceLight->gpu_point[n]) {
-        for (int s = 0; s < info.m_pFaceLight->numsamples; ++s) {
-          ppLightSamples[n][s].m_vecLighting +=
-              info.m_pFaceLight->gpu_point[n][s].m_vecLighting;
+  // GPU path: restore gpu_point[] contributions after supersampling.
+  // The supersampler replaced SS samples with CPU sky-only values;
+  // now add back the GPU point light energy.
+  if (g_bUseGPU) {
+    for (int i = 0; i < info.m_pFaceLight->numsamples; ++i) {
+      for (int n = 0; n < info.m_NormalCount; ++n) {
+        if (ppLightSamples[n] &&
+            info.m_pFaceLight->gpu_point[lightstyleIndex][n]) {
+          ppLightSamples[n][i].m_vecLighting +=
+              info.m_pFaceLight->gpu_point[lightstyleIndex][n][i].m_vecLighting;
         }
       }
     }
