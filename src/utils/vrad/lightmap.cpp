@@ -1480,7 +1480,6 @@ void CreateDirectLights(void) {
   directlight_t *dl = NULL;
   entity_t *e = NULL;
   char *name;
-  Vector dest;
 
   numdlights = 0;
 
@@ -2502,8 +2501,6 @@ static void ComputeIlluminationPointAndNormalsSSE(lightinfo_t const &l,
                                                   SSE_SampleInfo_t *pInfo,
                                                   int numSamples) {
 
-  Vector v[4];
-
   pInfo->m_Points = pos;
   bool computeNormals =
       (pInfo->m_NormalCount > 1 && (pInfo->m_IsDispFace || !l.isflat));
@@ -3426,7 +3423,7 @@ void BuildFacelights(int iThread, int facenum) {
   facelight_t *fl;
   SSE_SampleInfo_t sampleInfo;
   directlight_t *dl;
-  Vector spot;
+
   Vector v[4], n[4];
 
   if (g_bInterrupt)

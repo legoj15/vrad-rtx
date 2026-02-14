@@ -428,7 +428,7 @@ void DownloadAndApplyGPUResults() {
   int sampleCursor = 0;
 
   // Diagnostic accumulators
-  double totalR = 0, totalG = 0, totalB = 0, totalSun = 0;
+  double totalR = 0, totalG = 0, totalB = 0;
   int zeroSamples = 0, nonzeroSamples = 0;
   float maxR = 0, maxG = 0, maxB = 0;
 

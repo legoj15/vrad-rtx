@@ -162,16 +162,16 @@ void Rasterizer::Build() {
   // definitely unnecessary), we'd change this to a larger size.
   const int kFilterSampleRadius = 1;
 
-  int iMinX = GetCol(fMinX) - kFilterSampleRadius;
-  int iMinY = GetRow(fMinY) - kFilterSampleRadius;
-  int iMaxX = GetCol(fMaxX) + 1 + kFilterSampleRadius;
-  int iMaxY = GetRow(fMaxY) + 1 + kFilterSampleRadius;
+  int iMinX = (int)GetCol(fMinX) - kFilterSampleRadius;
+  int iMinY = (int)GetRow(fMinY) - kFilterSampleRadius;
+  int iMaxX = (int)GetCol(fMaxX) + 1 + kFilterSampleRadius;
+  int iMaxY = (int)GetRow(fMaxY) + 1 + kFilterSampleRadius;
 
   // Clamp to valid texture (integer) locations
   iMinX = max(0, iMinX);
   iMinY = max(0, iMinY);
-  iMaxX = min(iMaxX, mResX - 1);
-  iMaxY = min(iMaxY, mResY - 1);
+  iMaxX = min(iMaxX, (int)mResX - 1);
+  iMaxY = min(iMaxY, (int)mResY - 1);
 
   // Set the size to be as expected.
   // TODO: Pass this in from outside to minimize allocations
@@ -2291,7 +2291,7 @@ static void GenerateLightmapSamplesForMesh(
             size_t linearPos = rasterizer.GetLinearPos(it);
             Assert(linearPos < cTotalPixelCount);
 
-            if (colorTexels[linearPos].m_bValid) {
+            if (colorTexels[(int)linearPos].m_bValid) {
               continue;
             }
 
@@ -2300,8 +2300,8 @@ static void GenerateLightmapSamplesForMesh(
 
             bool doWrite =
                 it->insideTriangle ||
-                !colorTexels[linearPos].m_bPossiblyInteresting ||
-                colorTexels[linearPos].m_fDistanceToTri > ourDistancetoTri;
+                !colorTexels[(int)linearPos].m_bPossiblyInteresting ||
+                colorTexels[(int)linearPos].m_fDistanceToTri > ourDistancetoTri;
 
             if (doWrite) {
               Vector itWorldPos = worldPos[0] * it->barycentric.x +
@@ -2313,11 +2313,11 @@ static void GenerateLightmapSamplesForMesh(
                                      worldNormal[2] * it->barycentric.z;
               itWorldNormal.NormalizeInPlace();
 
-              colorTexels[linearPos].m_WorldPosition = itWorldPos;
-              colorTexels[linearPos].m_WorldNormal = itWorldNormal;
-              colorTexels[linearPos].m_bValid = it->insideTriangle;
-              colorTexels[linearPos].m_bPossiblyInteresting = true;
-              colorTexels[linearPos].m_fDistanceToTri = ourDistancetoTri;
+              colorTexels[(int)linearPos].m_WorldPosition = itWorldPos;
+              colorTexels[(int)linearPos].m_WorldNormal = itWorldNormal;
+              colorTexels[(int)linearPos].m_bValid = it->insideTriangle;
+              colorTexels[(int)linearPos].m_bPossiblyInteresting = true;
+              colorTexels[(int)linearPos].m_fDistanceToTri = ourDistancetoTri;
             }
           }
         }
