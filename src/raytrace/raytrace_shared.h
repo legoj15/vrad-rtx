@@ -68,6 +68,17 @@ struct RayResult {
   float3_t normal; // Surface normal at hit point
 };
 
+// Per-triangle texture shadow data (only for FCACHETRI_TRANSPARENT triangles)
+// Maps material entry index → UV coords + alpha texture atlas location
+struct GPUTextureShadowTri {
+  float u0, v0;    // UV for vertex 0
+  float u1, v1;    // UV for vertex 1
+  float u2, v2;    // UV for vertex 2
+  int atlasOffset; // Byte offset into flattened alpha texture atlas
+  short texWidth;
+  short texHeight;
+};
+
 // Parameters for CUDA kernel launches
 struct CUDATraceParams {
   const CUDAKDNode *nodes;

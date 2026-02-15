@@ -10,6 +10,20 @@
 #include "vmpi.h"
 #endif
 #include "vrad.h"
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+
+static void PrintCommitCharge(const char *label) {
+  PROCESS_MEMORY_COUNTERS_EX pmc = {};
+  pmc.cb = sizeof(pmc);
+  if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc,
+                           sizeof(pmc))) {
+    double commitMB = (double)pmc.PrivateUsage / (1024.0 * 1024.0);
+    double wsMB = (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
+    Msg("  [MEM] %s: Commit=%.0f MB, WorkingSet=%.0f MB\n", label, commitMB,
+        wsMB);
+  }
+}
 
 #ifdef MPI
 #include "messbuf.h"
@@ -506,6 +520,11 @@ transfer_t *BuildVisLeafs_Start() {
   return (transfer_t *)calloc(1, MAX_PATCHES * sizeof(transfer_t));
 }
 
+// Maximum number of rays to accumulate per GPU batch before flushing.
+// 2M rays × 36 bytes = ~72 MB per thread — well within RAM budget while
+// keeping GPU batches large enough for good utilization.
+#define MAX_GPU_RAY_BATCH (2 * 1024 * 1024)
+
 // If PatchCB is non-null, it is called after each row is generated (used by
 // MPI).
 void BuildVisLeafs_Cluster(int threadnum, transfer_t *transfers, int iCluster,
@@ -523,8 +542,16 @@ void BuildVisLeafs_Cluster(int threadnum, transfer_t *transfers, int iCluster,
   g_tPVSDecompTime[threadnum] += (pvsEnd - pvsStart);
   head = 0;
 
+#ifdef VRAD_RTX_CUDA_SUPPORT
+  // GPU path: batch rays across patches, flush when buffer exceeds threshold.
+  // This keeps GPU kernel launches large (good utilization) while bounding
+  // per-thread memory to ~72 MB instead of the previous unbounded growth
+  // that could reach 3-5 GB per thread on dense maps.
   CUtlVector<int> patchRayOffsets;
   CUtlVector<int> clusterPatches;
+  int lastFlushedPatch =
+      0; // Index into clusterPatches of first unprocessed patch
+#endif
 
   if (clusterChildren.Element(iCluster) != clusterChildren.InvalidIndex()) {
     CPatch *pNextPatch;
@@ -536,10 +563,10 @@ void BuildVisLeafs_Cluster(int threadnum, transfer_t *transfers, int iCluster,
       }
 
       int patchnum = patch - g_Patches.Base();
-      clusterPatches.AddToTail(patchnum);
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
       if (g_bUseGPU) {
+        clusterPatches.AddToTail(patchnum);
         patchRayOffsets.AddToTail(transferMaker.m_gpuRays.Count());
       }
 #endif
@@ -552,43 +579,63 @@ void BuildVisLeafs_Cluster(int threadnum, transfer_t *transfers, int iCluster,
       g_tVisCPUPrepTime[threadnum] += (end - start);
       g_tClusterIterTime[threadnum] += (end - start);
 
-#ifndef VRAD_RTX_CUDA_SUPPORT
+#ifdef VRAD_RTX_CUDA_SUPPORT
+      if (g_bUseGPU) {
+        // Flush if ray buffer exceeds threshold
+        if (transferMaker.m_gpuRays.Count() >= MAX_GPU_RAY_BATCH) {
+          patchRayOffsets.AddToTail(transferMaker.m_gpuRays.Count());
+          transferMaker.TraceAll();
+
+          // Process results for all patches accumulated since last flush
+          for (int i = lastFlushedPatch; i < clusterPatches.Count(); i++) {
+            int pn = clusterPatches[i];
+            int rstart = patchRayOffsets[i - lastFlushedPatch];
+            int rend = patchRayOffsets[i - lastFlushedPatch + 1];
+            for (int j = rstart; j < rend; j++) {
+              transferMaker.ProcessResult(j);
+            }
+            MakeScales(pn, transfers);
+            if (PatchCB)
+              PatchCB(threadnum, pn, &g_Patches.Element(pn));
+          }
+          lastFlushedPatch = clusterPatches.Count();
+
+          // Clear buffers and offsets for next batch
+          transferMaker.m_gpuRays.RemoveAll();
+          transferMaker.m_gpuPairs.RemoveAll();
+          transferMaker.m_gpuResults.RemoveAll();
+          patchRayOffsets.RemoveAll();
+        }
+        continue; // Skip the CPU Finish/MakeScales below
+      }
+#endif
+
+      // CPU path: process per-patch immediately
       transferMaker.Finish();
       MakeScales(patchnum, transfers);
       if (PatchCB)
         PatchCB(threadnum, patchnum, patch);
-#else
-      if (!g_bUseGPU) {
-        transferMaker.Finish();
-        MakeScales(patchnum, transfers);
-        if (PatchCB)
-          PatchCB(threadnum, patchnum, patch);
-      }
-#endif
     }
   }
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
-  if (g_bUseGPU && clusterPatches.Count() > 0) {
+  // Flush any remaining rays from the last partial batch
+  if (g_bUseGPU && clusterPatches.Count() > lastFlushedPatch) {
     patchRayOffsets.AddToTail(transferMaker.m_gpuRays.Count());
     transferMaker.TraceAll();
 
-    for (int i = 0; i < clusterPatches.Count(); i++) {
-      int patchnum = clusterPatches[i];
-      int start = patchRayOffsets[i];
-      int end = patchRayOffsets[i + 1];
-
-      for (int j = start; j < end; j++) {
+    for (int i = lastFlushedPatch; i < clusterPatches.Count(); i++) {
+      int pn = clusterPatches[i];
+      int rstart = patchRayOffsets[i - lastFlushedPatch];
+      int rend = patchRayOffsets[i - lastFlushedPatch + 1];
+      for (int j = rstart; j < rend; j++) {
         transferMaker.ProcessResult(j);
       }
-
-      MakeScales(patchnum, transfers);
+      MakeScales(pn, transfers);
       if (PatchCB)
-        PatchCB(threadnum, patchnum, &g_Patches.Element(patchnum));
+        PatchCB(threadnum, pn, &g_Patches.Element(pn));
     }
 
-    // IMPORTANT: Clear the batches after each cluster is finished!
-    // Otherwise, persistent CTransferMaker will re-trace previous clusters.
     transferMaker.m_gpuRays.RemoveAll();
     transferMaker.m_gpuPairs.RemoveAll();
     transferMaker.m_gpuResults.RemoveAll();
@@ -775,9 +822,9 @@ void InitGPUVisibility() {
             pNextPatch = &g_Patches.Element(pPatch->ndxNext);
           }
 
-          // Only add LEAF patches (patches with no children or valid cluster?)
-          // Actually in VRAD, patches with children are "parents" and we
-          // generally don't test against them? "if (patch->child1 !=
+          // Only add LEAF patches (patches with no children or valid
+          // cluster?) Actually in VRAD, patches with children are "parents"
+          // and we generally don't test against them? "if (patch->child1 !=
           // g_Patches.InvalidIndex()) continue;"
           if (pPatch->child1 == g_Patches.InvalidIndex()) {
             clusterLeafIndices.AddToTail(pPatch - g_Patches.Base());
@@ -790,8 +837,8 @@ void InitGPUVisibility() {
   }
 
   // 2. Face -> Root Patch Mapping (Unchanged, kept for reference if needed,
-  // though we might not need it for Leafs anymore) Actually the kernel probably
-  // won't use this if we feed it leaves directly.
+  // though we might not need it for Leafs anymore) Actually the kernel
+  // probably won't use this if we feed it leaves directly.
   CUtlVector<int> faceParentPatch;
   faceParentPatch.SetCount(numfaces);
   for (int i = 0; i < numfaces; i++) {
@@ -848,9 +895,12 @@ BuildVisMatrix
 void BuildVisMatrix(void) {
   double flStart = Plat_FloatTime();
 
+  PrintCommitCharge("BuildVisMatrix START");
+
 #ifdef VRAD_RTX_CUDA_SUPPORT
   if (g_bUseGPU) {
     InitGPUVisibility();
+    PrintCommitCharge("After InitGPUVisibility");
   }
 #endif
 
@@ -860,7 +910,11 @@ void BuildVisMatrix(void) {
   } else
 #endif
   {
+    Msg("  Launching BuildVisLeafs threads (%d clusters)...\n",
+        dvis->numclusters);
+    PrintCommitCharge("Before RunThreadsOn");
     RunThreadsOn(dvis->numclusters, true, BuildVisLeafs);
+    PrintCommitCharge("After RunThreadsOn");
   }
   double flEnd = Plat_FloatTime();
   double flWall = flEnd - flStart;

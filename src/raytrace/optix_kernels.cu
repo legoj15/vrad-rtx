@@ -90,6 +90,13 @@ struct OptixLaunchParams {
   // Sun Shadow Anti-aliasing
   int sunShadowSamples;  // Sub-luxel position samples (default 16)
   float sunShadowRadius; // World-space jitter radius in units (default 4.0)
+
+  // Texture Shadow Support
+  const int *d_triMaterials; // Per-triangle material index (-1 = opaque)
+  const GPUTextureShadowTri
+      *d_texShadowTris;              // Per-material-entry UV + atlas info
+  const unsigned char *d_alphaAtlas; // Flattened alpha texture data
+  int textureShadowsEnabled;         // 1 if texture shadows active, 0 otherwise
 };
 
 extern "C" __constant__ OptixLaunchParams params;
@@ -174,6 +181,38 @@ extern "C" __global__ void __anyhit__visibility() {
   if (tri.triangle_id == skip_id) {
     optixIgnoreIntersection();
     return;
+  }
+
+  // Texture shadow check: if enabled and triangle is transparent
+  if (params.textureShadowsEnabled && (tri.flags & 0x01)) {
+    int matIdx = params.d_triMaterials[primIdx];
+    if (matIdx >= 0) {
+      const GPUTextureShadowTri &mat = params.d_texShadowTris[matIdx];
+
+      // Get OptiX barycentric coordinates
+      // OptiX returns (b1, b2) where b0 = 1 - b1 - b2
+      float2 bary = optixGetTriangleBarycentrics();
+      float b0 = 1.0f - bary.x - bary.y;
+      float b1 = bary.x;
+      float b2 = bary.y;
+
+      // Interpolate UV coordinates
+      float u = b0 * mat.u0 + b1 * mat.u1 + b2 * mat.u2;
+      float v = b0 * mat.v0 + b1 * mat.v1 + b2 * mat.v2;
+
+      // Wrap (power-of-2 assumption matches CPU SampleMaterial)
+      int iu = __float2int_rn(u * mat.texWidth) & (mat.texWidth - 1);
+      int iv = __float2int_rn(v * mat.texHeight) & (mat.texHeight - 1);
+
+      unsigned char alpha =
+          params.d_alphaAtlas[mat.atlasOffset + iv * mat.texWidth + iu];
+
+      // Phase 1: Binary alpha test - alpha == 0 means fully transparent
+      if (alpha == 0) {
+        optixIgnoreIntersection();
+        return;
+      }
+    }
   }
 
   // Otherwise, accept the intersection (continue to closest-hit)
@@ -298,14 +337,14 @@ extern "C" __global__ void __raygen__cluster_visibility() {
       p5 = (unsigned int)-1; // Skip ID - don't self collide, but we offset
                              // origin anyway
 
-      // optixTrace
+      // optixTrace — use OPTIX_RAY_FLAG_NONE so any-hit runs for
+      // both skip_id filtering and texture shadow transparency
       optixTrace(
           params.traversable, startPos, dirNorm,
           0.0f,        // tmin
           len - 1e-4f, // tmax (fixed epsilon subtraction instead of scaling)
           0.0f, OptixVisibilityMask(255),
-          OPTIX_RAY_FLAG_DISABLE_ANYHIT,    // Shadow ray? We just want
-                                            // boolean visibility
+          OPTIX_RAY_FLAG_NONE, // Enable any-hit for texture shadows
           0, 1, 0, p0, p1, p2, p3, p4, p5); // Payload
 
       // Check result
@@ -358,14 +397,13 @@ __forceinline__ __device__ float TraceShadowRay(float3 origin, float3 direction,
   unsigned int p2 = 0, p3 = 0, p4 = 0;
   unsigned int p5 = (unsigned int)-1; // No skip ID for shadow rays
 
-  optixTrace(
-      params.traversable, origin, direction,
-      1e-3f, // tmin: avoid self-shadow artifacts (tested: 1e-4 worsened parity)
-      tmax,  // tmax: distance to light
-      0.0f,  // rayTime
-      OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1,
-      0, // SBT offset, stride, miss index
-      p0, p1, p2, p3, p4, p5);
+  optixTrace(params.traversable, origin, direction,
+             1e-3f, // tmin: avoid self-shadow artifacts
+             tmax,  // tmax: distance to light
+             0.0f,  // rayTime
+             OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1,
+             0, // SBT offset, stride, miss index
+             p0, p1, p2, p3, p4, p5);
 
   // Miss (hit_id == -1) means visible
   return ((int)p1 == -1) ? 1.0f : 0.0f;
@@ -614,10 +652,19 @@ extern "C" __global__ void __raygen__direct_lighting() {
 
     // ---------------------------------------------------------------
     // Shadow ray: trace from sample toward light
+    // Offset origin along sample normal by DIST_EPSILON to avoid
+    // self-intersection with the face the sample sits on. This matches
+    // the standard OptiX technique — the CPU doesn't need this because
+    // BSP plane tests naturally skip the originating face.
     // ---------------------------------------------------------------
-    float3 shadowDir =
-        make_float3(shadowOrigin.x - samplePos.x, shadowOrigin.y - samplePos.y,
-                    shadowOrigin.z - samplePos.z);
+    float3 offsetOrigin =
+        make_float3(samplePos.x + sampleNormal.x * GPU_DIST_EPSILON,
+                    samplePos.y + sampleNormal.y * GPU_DIST_EPSILON,
+                    samplePos.z + sampleNormal.z * GPU_DIST_EPSILON);
+
+    float3 shadowDir = make_float3(shadowOrigin.x - offsetOrigin.x,
+                                   shadowOrigin.y - offsetOrigin.y,
+                                   shadowOrigin.z - offsetOrigin.z);
     float shadowDist =
         sqrtf(shadowDir.x * shadowDir.x + shadowDir.y * shadowDir.y +
               shadowDir.z * shadowDir.z);
@@ -630,7 +677,7 @@ extern "C" __global__ void __raygen__direct_lighting() {
     shadowDir.y *= invShadowDist;
     shadowDir.z *= invShadowDist;
 
-    float visibility = TraceShadowRay(samplePos, shadowDir, shadowDist);
+    float visibility = TraceShadowRay(offsetOrigin, shadowDir, shadowDist);
 
     if (visibility <= 0.0f)
       continue;

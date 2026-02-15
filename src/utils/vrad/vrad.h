@@ -647,4 +647,8 @@ IVradStaticPropMgr *StaticPropMgr();
 extern float ComputeCoverageFromTexture(float b0, float b1, float b2,
                                         int32 hitID);
 
+#ifdef VRAD_RTX_CUDA_SUPPORT
+extern void UploadTextureShadowDataToGPU();
+#endif
+
 #endif // VRAD_H

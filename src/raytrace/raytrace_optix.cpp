@@ -131,6 +131,12 @@ float3_t *RayTraceOptiX::s_d_skyDirs = nullptr;
 int RayTraceOptiX::s_numSkyDirs = 0;
 float RayTraceOptiX::s_sunAngularExtent = 0.0f;
 
+// Texture Shadow Buffers
+int *RayTraceOptiX::s_d_triMaterials = nullptr;
+GPUTextureShadowTri *RayTraceOptiX::s_d_texShadowTris = nullptr;
+unsigned char *RayTraceOptiX::s_d_alphaAtlas = nullptr;
+bool RayTraceOptiX::s_textureShadowsEnabled = false;
+
 // Bounce GPU profiling accumulators (milliseconds from CUDA events)
 static float s_bounceUploadMs = 0.0f;
 static float s_bounceKernelMs = 0.0f;
@@ -177,6 +183,13 @@ struct OptixLaunchParams {
   // Sun Shadow Anti-aliasing
   int sunShadowSamples;  // Sub-luxel position samples (default 16)
   float sunShadowRadius; // World-space jitter radius in units (default 4.0)
+
+  // Texture Shadow Support
+  const int *d_triMaterials; // Per-triangle material index (-1 = opaque)
+  const GPUTextureShadowTri
+      *d_texShadowTris;              // Per-material-entry UV + atlas info
+  const unsigned char *d_alphaAtlas; // Flattened alpha texture data
+  int textureShadowsEnabled;         // 1 if texture shadows active, 0 otherwise
 };
 
 // Embedded PTX (will be set during build or loaded from file)
@@ -500,6 +513,9 @@ void RayTraceOptiX::Shutdown() {
   // Free sky direction buffer
   FreeSkyDirections();
 
+  // Free texture shadow buffers
+  FreeTextureShadowData();
+
   if (s_pipeline)
     optixPipelineDestroy((OptixPipeline)s_pipeline);
   if (s_raygenPG)
@@ -751,6 +767,12 @@ void RayTraceOptiX::TraceBatch(const RayBatch *rays, RayResult *results,
     launchParams.traversable = s_gas_handle;
     launchParams.triangles = s_d_triangles;
 
+    // Texture shadow data
+    launchParams.d_triMaterials = s_d_triMaterials;
+    launchParams.d_texShadowTris = s_d_texShadowTris;
+    launchParams.d_alphaAtlas = s_d_alphaAtlas;
+    launchParams.textureShadowsEnabled = s_textureShadowsEnabled ? 1 : 0;
+
     CUDA_CHECK_VOID(cudaMemcpyAsync(s_d_launchParams[bufIdx], &launchParams,
                                     sizeof(OptixLaunchParams),
                                     cudaMemcpyHostToDevice, stream));
@@ -872,6 +894,12 @@ void RayTraceOptiX::TraceClusterVisibility(
   params.pair_count_atomic = (int *)s_d_pairCount;
   params.max_pairs = s_maxVisibilityPairs;
 
+  // Texture shadow data
+  params.d_triMaterials = s_d_triMaterials;
+  params.d_texShadowTris = s_d_texShadowTris;
+  params.d_alphaAtlas = s_d_alphaAtlas;
+  params.textureShadowsEnabled = s_textureShadowsEnabled ? 1 : 0;
+
   // Upload to first launch params buffer slot
   CUDA_CHECK_VOID(cudaMemcpy(s_d_launchParams[0], &params,
                              sizeof(OptixLaunchParams),
@@ -959,6 +987,12 @@ void RayTraceOptiX::TraceDirectLighting(int numSamples) {
   params.numSunSamples = (s_sunAngularExtent > 0.0f) ? 30 : 0;
   params.sunShadowSamples = 16;  // Sub-luxel anti-aliasing
   params.sunShadowRadius = 2.0f; // World-space jitter radius
+
+  // Texture shadow data
+  params.d_triMaterials = s_d_triMaterials;
+  params.d_texShadowTris = s_d_texShadowTris;
+  params.d_alphaAtlas = s_d_alphaAtlas;
+  params.textureShadowsEnabled = s_textureShadowsEnabled ? 1 : 0;
 
   // Upload params to device
   CUDA_CHECK_VOID(cudaMemcpy(s_d_launchParams[0], &params,
@@ -1313,4 +1347,68 @@ void RayTraceOptiX::ResetBounceProfile() {
   s_bounceKernelMs = 0.0f;
   s_bounceDownloadMs = 0.0f;
   s_bounceProfileCount = 0;
+}
+
+// -----------------------------------------------------------------------------
+// UploadTextureShadowData - Upload per-triangle material data and alpha
+// texture atlas to GPU for texture shadow support in any-hit shader
+// -----------------------------------------------------------------------------
+void RayTraceOptiX::UploadTextureShadowData(
+    const int *triangleMaterials, int numTriangles,
+    const GPUTextureShadowTri *materialEntries, int numMaterialEntries,
+    const unsigned char *alphaAtlas, int atlasSize) {
+  if (!s_bInitialized)
+    return;
+
+  // Free any previous data
+  FreeTextureShadowData();
+
+  if (numMaterialEntries == 0 || atlasSize == 0) {
+    Msg("No texture shadow data to upload (0 material entries).\n");
+    s_textureShadowsEnabled = false;
+    return;
+  }
+
+  // Upload per-triangle material indices
+  size_t triMatSize = (size_t)numTriangles * sizeof(int);
+  CUDA_CHECK_VOID(cudaMalloc((void **)&s_d_triMaterials, triMatSize));
+  CUDA_CHECK_VOID(cudaMemcpy(s_d_triMaterials, triangleMaterials, triMatSize,
+                             cudaMemcpyHostToDevice));
+
+  // Upload per-material-entry UV + atlas data
+  size_t matEntrySize =
+      (size_t)numMaterialEntries * sizeof(GPUTextureShadowTri);
+  CUDA_CHECK_VOID(cudaMalloc((void **)&s_d_texShadowTris, matEntrySize));
+  CUDA_CHECK_VOID(cudaMemcpy(s_d_texShadowTris, materialEntries, matEntrySize,
+                             cudaMemcpyHostToDevice));
+
+  // Upload flattened alpha texture atlas
+  CUDA_CHECK_VOID(cudaMalloc((void **)&s_d_alphaAtlas, atlasSize));
+  CUDA_CHECK_VOID(cudaMemcpy(s_d_alphaAtlas, alphaAtlas, atlasSize,
+                             cudaMemcpyHostToDevice));
+
+  s_textureShadowsEnabled = true;
+
+  Msg("Uploaded Texture Shadow Data: %d material entries, %d triangles, "
+      "%.2f MB alpha atlas\n",
+      numMaterialEntries, numTriangles, atlasSize / (1024.0f * 1024.0f));
+}
+
+// -----------------------------------------------------------------------------
+// FreeTextureShadowData - Release GPU texture shadow buffers
+// -----------------------------------------------------------------------------
+void RayTraceOptiX::FreeTextureShadowData() {
+  if (s_d_triMaterials) {
+    cudaFree(s_d_triMaterials);
+    s_d_triMaterials = nullptr;
+  }
+  if (s_d_texShadowTris) {
+    cudaFree(s_d_texShadowTris);
+    s_d_texShadowTris = nullptr;
+  }
+  if (s_d_alphaAtlas) {
+    cudaFree(s_d_alphaAtlas);
+    s_d_alphaAtlas = nullptr;
+  }
+  s_textureShadowsEnabled = false;
 }

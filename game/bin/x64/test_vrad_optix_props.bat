@@ -1,2 +1,2 @@
 @echo off
-pwsh.exe -ExecutionPolicy Bypass -File .\test_vrad_optix_props.ps1 %*
+pwsh.exe -ExecutionPolicy Bypass -File .\run_tests.ps1 -TestNames props %*

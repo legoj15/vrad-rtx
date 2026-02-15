@@ -850,6 +850,92 @@ float ComputeCoverageFromTexture(float b0, float b1, float b2, int32 hitID) {
                           g_RtEnv.GetTriangleMaterial(hitID), coords, false);
 }
 
+#ifdef VRAD_RTX_CUDA_SUPPORT
+//-----------------------------------------------------------------------------
+// Build GPU texture shadow data from g_ShadowTextureList and upload to GPU.
+// Called once after BuildScene() when -textureshadows is enabled.
+//-----------------------------------------------------------------------------
+void UploadTextureShadowDataToGPU() {
+  int numMaterialEntries = g_ShadowTextureList.m_MaterialEntries.Count();
+  if (numMaterialEntries == 0) {
+    Msg("No texture shadow material entries to upload.\n");
+    return;
+  }
+
+  // Step 1: Build a flat alpha texture atlas from all loaded textures.
+  // Also build a mapping from texture dict index → atlas byte offset.
+  int numTextures = g_ShadowTextureList.m_Textures.Count();
+  CUtlVector<int> atlasOffsets;
+  atlasOffsets.SetCount(g_ShadowTextureList.m_Textures.MaxElement());
+  for (int i = 0; i < atlasOffsets.Count(); i++)
+    atlasOffsets[i] = -1;
+
+  // Calculate total atlas size and record offsets
+  int totalAtlasSize = 0;
+  for (int i = g_ShadowTextureList.m_Textures.First();
+       i != g_ShadowTextureList.m_Textures.InvalidIndex();
+       i = g_ShadowTextureList.m_Textures.Next(i)) {
+    const CShadowTextureList::alphatexture_t &tex =
+        g_ShadowTextureList.m_Textures.Element(i);
+    atlasOffsets[i] = totalAtlasSize;
+    totalAtlasSize += tex.width * tex.height;
+  }
+
+  if (totalAtlasSize == 0) {
+    Msg("No alpha texture data to upload.\n");
+    return;
+  }
+
+  // Allocate and fill the atlas
+  unsigned char *alphaAtlas = new unsigned char[totalAtlasSize];
+  for (int i = g_ShadowTextureList.m_Textures.First();
+       i != g_ShadowTextureList.m_Textures.InvalidIndex();
+       i = g_ShadowTextureList.m_Textures.Next(i)) {
+    const CShadowTextureList::alphatexture_t &tex =
+        g_ShadowTextureList.m_Textures.Element(i);
+    memcpy(alphaAtlas + atlasOffsets[i], tex.pAlphaTexels,
+           tex.width * tex.height);
+  }
+
+  // Step 2: Build per-material-entry GPU data
+  GPUTextureShadowTri *gpuMatEntries =
+      new GPUTextureShadowTri[numMaterialEntries];
+  for (int i = 0; i < numMaterialEntries; i++) {
+    const CShadowTextureList::materialentry_t &mat =
+        g_ShadowTextureList.m_MaterialEntries[i];
+    const CShadowTextureList::alphatexture_t &tex =
+        g_ShadowTextureList.m_Textures.Element(mat.textureIndex);
+
+    gpuMatEntries[i].u0 = mat.uv[0].x;
+    gpuMatEntries[i].v0 = mat.uv[0].y;
+    gpuMatEntries[i].u1 = mat.uv[1].x;
+    gpuMatEntries[i].v1 = mat.uv[1].y;
+    gpuMatEntries[i].u2 = mat.uv[2].x;
+    gpuMatEntries[i].v2 = mat.uv[2].y;
+    gpuMatEntries[i].atlasOffset = atlasOffsets[mat.textureIndex];
+    gpuMatEntries[i].texWidth = tex.width;
+    gpuMatEntries[i].texHeight = tex.height;
+  }
+
+  // Step 3: Get per-triangle material indices from g_RtEnv
+  int numTriangles = g_RtEnv.TriangleMaterials.Count();
+  const int *triMaterials = g_RtEnv.TriangleMaterials.Base();
+
+  Msg("Texture Shadows: %d material entries, %d triangles, %d textures, "
+      "%.2f MB atlas\n",
+      numMaterialEntries, numTriangles, numTextures,
+      totalAtlasSize / (1024.0f * 1024.0f));
+
+  // Step 4: Upload to GPU
+  RayTraceOptiX::UploadTextureShadowData(triMaterials, numTriangles,
+                                         gpuMatEntries, numMaterialEntries,
+                                         alphaAtlas, totalAtlasSize);
+
+  delete[] gpuMatEntries;
+  delete[] alphaAtlas;
+}
+#endif // VRAD_RTX_CUDA_SUPPORT
+
 // this is here to strip models/ or .mdl or whatnot
 void CleanModelName(const char *pModelName, char *pOutput, int outLen) {
   // strip off leading models/ if it exists
@@ -942,8 +1028,9 @@ void CVradStaticPropMgr::CreateCollisionModel(char const *pModelName) {
   }
 
   if (g_bTextureShadows) {
-    if ((pHdr->flags & STUDIOHDR_FLAGS_CAST_TEXTURE_SHADOWS) ||
-        IsModelTextureShadowsForced(pModelName)) {
+    bool bHasFlag = (pHdr->flags & STUDIOHDR_FLAGS_CAST_TEXTURE_SHADOWS) != 0;
+    bool bForced = IsModelTextureShadowsForced(pModelName);
+    if (bHasFlag || bForced) {
       m_StaticPropDict[i].m_textureShadowIndex.RemoveAll();
       m_StaticPropDict[i].m_triangleMaterialIndex.RemoveAll();
       m_StaticPropDict[i].m_textureShadowIndex.AddMultipleToTail(
@@ -1745,7 +1832,9 @@ void CVradStaticPropMgr::ComputeLighting(int iThread) {
   } else
 #endif
   {
+#define NO_THREAD_NAMES
     RunThreadsOn(count, true, ThreadComputeStaticPropLighting);
+#undef NO_THREAD_NAMES
   }
 
   // restore default
@@ -1842,6 +1931,7 @@ void CVradStaticPropMgr::AddPolysForRayTrace(void) {
           // list
           mstudiomesh_t *pMesh = pStudioModel->pMesh(nMesh);
           mstudiotexture_t *pTxtr = pStudioHdr->pTexture(pMesh->material);
+
           // printf("mat idx=%d mat
           // name=%s\n",pMesh->material,pTxtr->pszName());
           bool bSkipThisMesh = false;
@@ -1865,6 +1955,7 @@ void CVradStaticPropMgr::AddPolysForRayTrace(void) {
           OptimizedModel::MeshHeader_t *pVtxMesh = pVtxLOD->pMesh(nMesh);
           const mstudio_meshvertexdata_t *vertData =
               pMesh->GetVertexData((void *)pStudioHdr);
+
           Assert(vertData); // This can only return NULL on X360 for now
 
           for (int nGroup = 0; nGroup < pVtxMesh->numStripGroups; ++nGroup) {
@@ -1913,6 +2004,7 @@ void CVradStaticPropMgr::AddPolysForRayTrace(void) {
                               shadowTextureIndex, *vertData->Texcoord(vertex1),
                               *vertData->Texcoord(vertex2),
                               *vertData->Texcoord(vertex3));
+
                       if (coverage < 1.0f) {
                         materialIndex = g_ShadowTextureList.AddMaterialEntry(
                             shadowTextureIndex, *vertData->Texcoord(vertex1),

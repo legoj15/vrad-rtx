@@ -56,6 +56,15 @@ public:
   static void UploadSkyDirections(float sunAngularExtent);
   static void FreeSkyDirections();
 
+  // Texture Shadow Support
+  static void
+  UploadTextureShadowData(const int *triangleMaterials, int numTriangles,
+                          const GPUTextureShadowTri *materialEntries,
+                          int numMaterialEntries,
+                          const unsigned char *alphaAtlas, int atlasSize);
+  static void FreeTextureShadowData();
+  static bool HasTextureShadowData() { return s_d_texShadowTris != nullptr; }
+
   // Device info
   static const char *GetDeviceName() { return s_szDeviceName; }
   static int GetDeviceMemoryMB() { return s_nDeviceMemoryMB; }
@@ -133,6 +142,13 @@ private:
   static float3_t *s_d_skyDirs; // Device pointer
   static int s_numSkyDirs;
   static float s_sunAngularExtent;
+
+  // Texture shadow data on GPU
+  static int *s_d_triMaterials; // Per-triangle material index (-1 = opaque)
+  static GPUTextureShadowTri
+      *s_d_texShadowTris;               // Per-material-entry UV + atlas info
+  static unsigned char *s_d_alphaAtlas; // Flattened alpha texture data
+  static bool s_textureShadowsEnabled;
 
 public:
   // GPU Bounce light gathering

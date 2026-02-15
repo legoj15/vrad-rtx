@@ -593,7 +593,10 @@ void ComputePerLeafAmbientLighting() {
   } else
 #endif
   {
+    StartPacifier("Computing leaf ambient : ");
+#define NO_THREAD_NAMES
     RunThreadsOn(numleafs, true, ThreadComputeLeafAmbient);
+#undef NO_THREAD_NAMES
   }
 
   // now write out the data

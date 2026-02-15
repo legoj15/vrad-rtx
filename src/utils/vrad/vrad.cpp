@@ -103,6 +103,7 @@ bool g_bLargeDispSampleRadius = false;
 
 bool g_bOnlyStaticProps = false;
 bool g_bShowStaticPropNormals = false;
+bool g_bCountLightsOnly = false;
 
 float gamma = 0.5;
 float indirect_sun = 1.0;
@@ -137,6 +138,10 @@ bool g_bStaticPropLighting = false;
 bool g_bStaticPropPolys = false;
 bool g_bTextureShadows = false;
 bool g_bDisablePropSelfShadowing = false;
+
+// Dedicated heap for transfer list allocations.  HeapDestroy releases all
+// memory at once, avoiding 500K+ individual free() calls under heavy pressure.
+static HANDLE g_hTransferHeap = NULL;
 
 // GPU Ray Tracing
 bool g_bUseGPU = false;
@@ -982,7 +987,7 @@ MakeScales
   It can be run multi threaded.
 =============
 */
-volatile int total_transfer;
+volatile long long total_transfer;
 volatile int max_transfer;
 
 //-----------------------------------------------------------------------------
@@ -1141,8 +1146,8 @@ void MakeScales(int ndxPatch, transfer_t *all_transfers) {
       }
     }
 
-    patch->transfers =
-        (transfer_t *)malloc(patch->numtransfers * sizeof(transfer_t));
+    patch->transfers = (transfer_t *)HeapAlloc(
+        g_hTransferHeap, 0, patch->numtransfers * sizeof(transfer_t));
     if (!patch->transfers)
       Error("Memory allocation failure");
 
@@ -1172,8 +1177,38 @@ void MakeScales(int ndxPatch, transfer_t *all_transfers) {
     // patch->totallight[2] = 255;
   }
 
-  ThreadInterlockedExchangeAdd((int32 volatile *)&total_transfer,
-                               patch->numtransfers);
+  InterlockedExchangeAdd64(&total_transfer, patch->numtransfers);
+}
+
+//-----------------------------------------------------------------------------
+// FreeTransferLists - Release all per-patch transfer allocations.
+// Called after CSR is built (transfers are now in GPU memory) to reclaim
+// the potentially massive amount of host RAM used by patch->transfers.
+//-----------------------------------------------------------------------------
+static void FreeTransferLists(void) {
+  double startTime = Plat_FloatTime();
+  unsigned int numPatches = g_Patches.Size();
+  long long freedBytes = 0;
+  for (unsigned int i = 0; i < numPatches; i++) {
+    CPatch *patch = &g_Patches[i];
+    if (patch->transfers) {
+      freedBytes += (long long)patch->numtransfers * sizeof(transfer_t);
+      patch->transfers = nullptr;
+    }
+  }
+
+  // HeapDestroy releases all allocations in a single OS call — O(1) instead
+  // of 576K individual free() calls.  Under 17 GB memory pressure, the
+  // per-allocation free path took ~260 seconds due to page table thrashing.
+  if (g_hTransferHeap) {
+    HeapDestroy(g_hTransferHeap);
+    g_hTransferHeap = NULL;
+  }
+
+  double elapsed = Plat_FloatTime() - startTime;
+  double freedMB = (double)freedBytes / (1024.0 * 1024.0);
+  Msg("  Freed transfer lists: %.1f MB (%.1f GB) in %.2f seconds\n", freedMB,
+      freedMB / 1024.0, elapsed);
 }
 
 /*
@@ -1600,16 +1635,25 @@ static void BuildBounceCSR_GPU(void) {
   if (numPatches == 0)
     return;
 
-  Msg("Building CSR for GPU bounces (%d patches, %d transfers)...\n",
+  Msg("Building CSR for GPU bounces (%u patches, %lld transfers)...\n",
       numPatches, total_transfer);
   double startTime = Plat_FloatTime();
 
-  int totalTrans = (int)total_transfer;
+  long long totalTrans = total_transfer;
 
-  // Build CSR arrays
-  int *csrOffsets = (int *)malloc((numPatches + 1) * sizeof(int));
-  int *csrPatch = (int *)malloc(totalTrans * sizeof(int));
-  float *csrWeight = (float *)malloc(totalTrans * sizeof(float));
+  // Guard: CSR indices use int (32-bit). If total transfers exceeds INT_MAX,
+  // GPU bounces cannot be used — fall back to CPU GatherLight.
+  if (totalTrans > (long long)INT_MAX) {
+    Warning("WARNING: Total transfers (%lld) exceeds INT_MAX (%d). "
+            "GPU bounces disabled; falling back to CPU GatherLight.\n",
+            totalTrans, INT_MAX);
+    return;
+  }
+
+  // Build CSR arrays (use size_t for allocation to handle large counts)
+  int *csrOffsets = (int *)malloc((size_t)(numPatches + 1) * sizeof(int));
+  int *csrPatch = (int *)malloc((size_t)totalTrans * sizeof(int));
+  float *csrWeight = (float *)malloc((size_t)totalTrans * sizeof(float));
 
   // Per-patch data (as flat float arrays, 3 floats per Vector)
   float *reflectivity = (float *)malloc(numPatches * 3 * sizeof(float));
@@ -1631,10 +1675,10 @@ static void BuildBounceCSR_GPU(void) {
   // Count bump patches for bump normal array
   int numBumpPatches = 0;
 
-  int offset = 0;
+  long long offset = 0;
   for (unsigned int i = 0; i < numPatches; i++) {
     CPatch *patch = &g_Patches[i];
-    csrOffsets[i] = offset;
+    csrOffsets[i] = (int)offset;
 
     // Copy transfer list into CSR
     for (int k = 0; k < patch->numtransfers; k++) {
@@ -1661,7 +1705,7 @@ static void BuildBounceCSR_GPU(void) {
     if (patch->needsBumpmap)
       numBumpPatches++;
   }
-  csrOffsets[numPatches] = offset;
+  csrOffsets[numPatches] = (int)offset;
 
   // Precompute bump normals (4 normals per patch: flat + 3 bump)
   float *bumpNormals = nullptr;
@@ -1953,27 +1997,50 @@ void RadWorld_Start() {
   BuildClusterTable();
 
   // turn each face into a single patch
-  MakePatches();
-  AllocateEdgeshare();
-  PairEdges();
+  {
+    double t0 = Plat_FloatTime();
+    MakePatches();
+    AllocateEdgeshare();
+    PairEdges();
 
-  // store the vertex normals calculated in PairEdges
-  // so that the can be written to the bsp file for
-  // use in the engine
-  SaveVertexNormals();
-  FreeEdgeshare(); // ~7 MB reclaimed after setup
+    // store the vertex normals calculated in PairEdges
+    // so that the can be written to the bsp file for
+    // use in the engine
+    SaveVertexNormals();
+    FreeEdgeshare(); // ~7 MB reclaimed after setup
+    Msg("MakePatches + PairEdges: %.2f seconds\n", Plat_FloatTime() - t0);
+  }
 
   // subdivide patches to a maximum dimension
-  SubdividePatches();
+  {
+    double t0 = Plat_FloatTime();
+    SubdividePatches();
+    Msg("SubdividePatches: %.2f seconds\n", Plat_FloatTime() - t0);
+  }
 
   // add displacement faces to cluster table
   AddDispsToClusterTable();
 
   // create directlights out of patches and lights
-  CreateDirectLights();
+  {
+    double t0 = Plat_FloatTime();
+    CreateDirectLights();
 
-  // Precompute per-cluster light lists from PVS data
-  BuildPerClusterLightLists();
+    // Precompute per-cluster light lists from PVS data
+    BuildPerClusterLightLists();
+    Msg("CreateDirectLights + ClusterLists: %.2f seconds\n",
+        Plat_FloatTime() - t0);
+  }
+
+  // Fail early if the light count exceeds what the BSP format (and GMod)
+  // can handle.  Checking here avoids wasting minutes on BuildFacelights
+  // only to hit the same error later in ExportDirectLightsToWorldLights.
+  // Skip the fatal exit in -countlights mode so we can report the count.
+  if (!g_bCountLightsOnly && numdlights > MAX_MAP_WORLDLIGHTS) {
+    Error("Too many lights (%d / %d). Reduce light-emitting entities or "
+          "surface lights.\n",
+          numdlights, MAX_MAP_WORLDLIGHTS);
+  }
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
   // Initialize GPU direct lighting with converted light data
@@ -2062,16 +2129,23 @@ void BuildFacesVisibleToLights(bool bAllVisible) {
 }
 
 void MakeAllScales(void) {
+  // Create a dedicated heap for transfer allocations.  HeapDestroy releases
+  // all memory at once, avoiding the O(N) cost of individually freeing 500K+
+  // allocations totaling several GB under heavy memory pressure.
+  g_hTransferHeap = HeapCreate(0, 0, 0);
+  if (!g_hTransferHeap)
+    Error("Failed to create transfer heap\n");
+
   // determine visibility between patches
   BuildVisMatrix();
 
   // release visibility matrix
   FreeVisMatrix();
 
-  Msg("transfers %d, max %d\n", total_transfer, max_transfer);
-
-  qprintf("transfer lists: %5.1f megs\n",
-          (float)total_transfer * sizeof(transfer_t) / (1024 * 1024));
+  Msg("transfers %lld, max %d\n", total_transfer, max_transfer);
+  double transferMB =
+      (double)total_transfer * sizeof(transfer_t) / (1024.0 * 1024.0);
+  Msg("  transfer data: %.1f MB (%.1f GB)\n", transferMB, transferMB / 1024.0);
 }
 
 // Helper function. This can be useful to visualize the world and faces and see
@@ -2212,7 +2286,7 @@ bool RadWorld_Go() {
 
       // CPU supersampling + patch lights (all gradient passes, all lights)
       phaseStart = Plat_FloatTime();
-      RunThreadsOnIndividual(numfaces, false, FinalizeAndSupersample);
+      RunThreadsOnIndividual(numfaces, true, FinalizeAndSupersample);
       ssTime = Plat_FloatTime() - phaseStart;
     }
 #endif
@@ -2314,14 +2388,23 @@ bool RadWorld_Go() {
     return false;
 
   // Figure out the offset into lightmap data for each face.
-  PrecompLightmapOffsets();
+  {
+    double t0 = Plat_FloatTime();
+    PrecompLightmapOffsets();
+    Msg("PrecompLightmapOffsets: %.2f seconds\n", Plat_FloatTime() - t0);
+  }
 
   // If we're doing incremental lighting, stop here.
   if (g_pIncremental) {
     g_pIncremental->Finalize();
   } else {
     // free up the direct lights now that we have facelights
-    ExportDirectLightsToWorldLights();
+    {
+      double t0 = Plat_FloatTime();
+      ExportDirectLightsToWorldLights();
+      Msg("ExportDirectLightsToWorldLights: %.2f seconds\n",
+          Plat_FloatTime() - t0);
+    }
 
     if (g_bDumpPatches) {
       for (int iBump = 0; iBump < 4; ++iBump) {
@@ -2347,6 +2430,15 @@ bool RadWorld_Go() {
 #ifdef VRAD_RTX_CUDA_SUPPORT
       // Build CSR and upload transfers to GPU for bounce acceleration
       BuildBounceCSR_GPU();
+
+      // Free per-patch transfer lists now that data is in GPU CSR buffers.
+      // This reclaims the (potentially massive) host RAM used by
+      // patch->transfers. CPU bounce fallback (GatherLight) is not affected
+      // because it is only used when g_bBounceGPU is false, in which case
+      // BuildBounceCSR_GPU returns early and we skip this free.
+      if (g_bBounceGPU) {
+        FreeTransferLists();
+      }
 #endif
 
       // spread light around
@@ -2435,6 +2527,10 @@ void VRAD_LoadBSP(char const *pFilename) {
     _snprintf(logFile, sizeof(logFile), "%s.log", source);
     SetSpewFunctionLogFile(logFile);
   }
+
+  // Log the build timestamp (the console banner is printed before the log file
+  // exists, so repeat it here so it appears in the .log file).
+  Msg("vrad_rtx_dll.dll built: " __DATE__ " " __TIME__ "\n");
 
   LoadPhysicsDLL();
 
@@ -2580,6 +2676,11 @@ void VRAD_LoadBSP(char const *pFilename) {
           g_RtEnv.TriangleIndexList, g_RtEnv.TriangleVertices,
           g_RtEnv.m_MinBound, g_RtEnv.m_MaxBound);
 
+      // Upload texture shadow data to GPU if enabled
+      if (g_bTextureShadows) {
+        UploadTextureShadowDataToGPU();
+      }
+
       end = Plat_FloatTime();
       printf("Done (%.2f seconds)\n", end - start);
     } else {
@@ -2619,14 +2720,22 @@ void VRAD_ComputeOtherLighting() {
   double start = Plat_FloatTime();
   // Compute lighting for the bsp file
   if (!g_bNoDetailLighting) {
+    double t0 = Plat_FloatTime();
     ComputeDetailPropLighting(THREADINDEX_MAIN);
+    Msg("ComputeDetailPropLighting: %.2f seconds\n", Plat_FloatTime() - t0);
   }
 
-  ComputePerLeafAmbientLighting();
+  {
+    double t0 = Plat_FloatTime();
+    ComputePerLeafAmbientLighting();
+    Msg("ComputePerLeafAmbientLighting: %.2f seconds\n", Plat_FloatTime() - t0);
+  }
 
   // bake the static props high quality vertex lighting into the bsp
   if (!do_fast && g_bStaticPropLighting) {
+    double t0 = Plat_FloatTime();
     StaticPropMgr()->ComputeLighting(THREADINDEX_MAIN);
+    Msg("StaticPropLighting: %.2f seconds\n", Plat_FloatTime() - t0);
   }
   g_flOtherLightingTime += Plat_FloatTime() - start;
 }
@@ -2645,7 +2754,11 @@ void VRAD_Finish() {
 #ifdef MPI
   VMPI_SetCurrentStage("WriteBSPFile");
 #endif
-  WriteBSPFile(source);
+  {
+    double t0 = Plat_FloatTime();
+    WriteBSPFile(source);
+    Msg("WriteBSPFile: %.2f seconds\n", Plat_FloatTime() - t0);
+  }
 
   if (g_bDumpPatches) {
     for (int iStyle = 0; iStyle < 4; ++iStyle) {
@@ -2839,6 +2952,8 @@ int ParseCommandLine(int argc, char **argv, bool *onlydetail) {
       g_bLogHashData = true;
     } else if (!Q_stricmp(argv[i], "-onlydetail")) {
       *onlydetail = true;
+    } else if (!Q_stricmp(argv[i], "-countlights")) {
+      g_bCountLightsOnly = true;
     } else if (!Q_stricmp(argv[i], "-softsun")) {
       if (++i < argc) {
         g_SunAngularExtent = atof(argv[i]);
@@ -3016,6 +3131,8 @@ void PrintUsage(int argc, char **argv) {
       "  -avx2           : Use AVX2/FMA3/SSE4.1 SIMD instructions for\n"
       "                    ~10-20%% faster math (requires Haswell+ or "
       "Zen+).\n"
+      "  -countlights    : Count surface lights and exit (prints LIGHTCOUNT: "
+      "N).\n"
       "  -bounce #       : Set max number of bounces (default: 100).\n"
       "  -fast           : Quick and dirty lighting.\n"
       "  -fastambient    : Per-leaf ambient sampling is lower quality to save "
@@ -3133,10 +3250,10 @@ int RunVRAD(int argc, char **argv) {
   int i = ParseCommandLine(argc, argv, &onlydetail);
 
 #if defined(_MSC_VER) && (_MSC_VER >= 1310)
-  Msg("Valve Software - vrad_rtx.exe %s (" __DATE__ ")\n",
+  Msg("Valve Software - vrad_rtx_dll.dll %s (" __DATE__ " " __TIME__ ")\n",
       g_bUseAVX2 ? "AVX2" : "SSE");
 #else
-  Msg("Valve Software - vrad_rtx.exe (" __DATE__ ")\n");
+  Msg("Valve Software - vrad_rtx_dll.dll (" __DATE__ " " __TIME__ ")\n");
 #endif
 
   Msg("\n      Valve Radiosity Simulator     \n");
@@ -3153,6 +3270,17 @@ int RunVRAD(int argc, char **argv) {
   Q_FileBase(source, source, sizeof(source));
 
   VRAD_LoadBSP(argv[i]);
+
+  // Fast "count and exit" mode: print the light count and bail out
+  // before doing any actual lighting work.
+  if (g_bCountLightsOnly) {
+    Msg("LIGHTCOUNT: %d\n", numdlights);
+    if (numdlights > 32767)
+      Msg("LIGHTCOUNT_EXCEEDED: true\n");
+    DeleteCmdLine(argc, argv);
+    CmdLib_Cleanup();
+    return 0;
+  }
 
   if ((!onlydetail) && (!g_bOnlyStaticProps)) {
     RadWorld_Go();

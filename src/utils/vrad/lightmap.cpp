@@ -2825,12 +2825,10 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
     }
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
-    // GPU path: skip non-sky lights — GPU already evaluated point lights.
-    // Only sky lights need CPU evaluation at sub-positions.
-    if (g_bUseGPU && dl->light.type != emit_skylight &&
-        dl->light.type != emit_skyambient) {
-      continue;
-    }
+    // GPU path: during supersampling, evaluate ALL light types at
+    // sub-positions. The CPU supersample result fully replaces the
+    // per-luxel value for qualifying samples, so there is no
+    // double-counting with the GPU single-sample pass.
 #endif
 
     if ((flags & AMBIENT_ONLY) && (dl->light.type != emit_skyambient))
@@ -3145,23 +3143,9 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
   // lightstyle for all bumped lighting
   LightingValue_t **ppLightSamples = info.m_pFaceLight->light[lightstyleIndex];
 
-#ifdef VRAD_RTX_CUDA_SUPPORT
-  // GPU path: subtract gpu_point[] before gradient detection so that
-  // point light energy doesn't trigger false gradients. This lets the
-  // supersampler evaluate only sky lights at sub-positions.
-  if (g_bUseGPU) {
-    for (int i = 0; i < info.m_pFaceLight->numsamples; ++i) {
-      for (int n = 0; n < info.m_NormalCount; ++n) {
-        if (ppLightSamples[n] &&
-            info.m_pFaceLight->gpu_point[lightstyleIndex][n]) {
-          ppLightSamples[n][i].m_vecLighting -=
-              info.m_pFaceLight->gpu_point[lightstyleIndex][n][i].m_vecLighting;
-        }
-      }
-    }
-  }
-#endif
-
+  // Compute intensities on the FULL lightmap data (including GPU point
+  // light contributions) so that gradient detection sees point light
+  // shadow edges — these are the primary source of high gradients.
   ComputeSampleIntensities(info, ppLightSamples, pSampleIntensity);
 
   Vector *pVisualizePass = NULL;
@@ -3218,15 +3202,8 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
       }
 
       // Supersample the ambient light for each bump direction vector
-#ifdef VRAD_RTX_CUDA_SUPPORT
-      int ambientSupersampleCount = 0;
-      if (!g_bUseGPU) {
-#endif
-        ambientSupersampleCount = SupersampleLightAtPoint(
-            l, info, i, lightstyleIndex, pAmbientLight, AMBIENT_ONLY);
-#ifdef VRAD_RTX_CUDA_SUPPORT
-      }
-#endif
+      int ambientSupersampleCount = SupersampleLightAtPoint(
+          l, info, i, lightstyleIndex, pAmbientLight, AMBIENT_ONLY);
 
       // Supersample the non-ambient light for each bump direction vector
       int directSupersampleCount = SupersampleLightAtPoint(
@@ -3243,10 +3220,6 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
           ppLightSamples[n][i].Zero();
           ppLightSamples[n][i].AddWeighted(pDirectLight[n],
                                            1.0f / directSupersampleCount);
-#ifdef VRAD_RTX_CUDA_SUPPORT
-          // GPU path: ambient sky is correctly re-evaluated at
-          // sub-positions via RS4Pts (only sky lights evaluated).
-#endif
           ppLightSamples[n][i].AddWeighted(pAmbientLight[n],
                                            1.0f / ambientSupersampleCount);
         }
@@ -3259,23 +3232,6 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
     // We've finished another pass
     pass++;
   }
-
-#ifdef VRAD_RTX_CUDA_SUPPORT
-  // GPU path: restore gpu_point[] contributions after supersampling.
-  // The supersampler replaced SS samples with CPU sky-only values;
-  // now add back the GPU point light energy.
-  if (g_bUseGPU) {
-    for (int i = 0; i < info.m_pFaceLight->numsamples; ++i) {
-      for (int n = 0; n < info.m_NormalCount; ++n) {
-        if (ppLightSamples[n] &&
-            info.m_pFaceLight->gpu_point[lightstyleIndex][n]) {
-          ppLightSamples[n][i].m_vecLighting +=
-              info.m_pFaceLight->gpu_point[lightstyleIndex][n][i].m_vecLighting;
-        }
-      }
-    }
-  }
-#endif
 
   if (debug_extra) {
     // Copy colors representing which supersample pass the sample was messed

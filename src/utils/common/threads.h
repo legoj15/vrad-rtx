@@ -62,13 +62,13 @@ void ThreadUnlock(void);
 #define RunThreadsOn(n, p, f)                                                  \
   {                                                                            \
     if (p)                                                                     \
-      printf("%-20s ", #f ":");                                                \
+      Msg("%-20s ", #f ":");                                                   \
     RunThreadsOn(n, p, f);                                                     \
   }
 #define RunThreadsOnIndividual(n, p, f)                                        \
   {                                                                            \
     if (p)                                                                     \
-      printf("%-20s ", #f ":");                                                \
+      Msg("%-20s ", #f ":");                                                   \
     RunThreadsOnIndividual(n, p, f);                                           \
   }
 #endif
