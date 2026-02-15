@@ -378,12 +378,16 @@ extern "C" __global__ void __raygen__cluster_visibility() {
 // GatherSampleStandardLightSSE math), traces an inline shadow ray for
 // occlusion, and atomicAdd's the contribution to the output buffer.
 //
-// Only handles emit_point (0), emit_surface (1), emit_spotlight (2).
-// Sky lights (3, 4) stay on CPU.
+// Handles all light types: emit_point (0), emit_surface (1), emit_spotlight
+// (2), emit_skylight (3), and emit_skyambient (5). Sky/ambient use TraceSkyRay
+// for visibility; CPU only stores sunAmount.
 //=============================================================================
 
 // DIST_EPSILON from Source Engine (bspfile.h)
 #define GPU_DIST_EPSILON 0.03125f
+// MAX_TRACE_LENGTH = sqrt(3) * 2 * MAX_COORD_INTEGER (Source Engine
+// worldsize.h)
+#define GPU_MAX_TRACE_LENGTH 56755.84f
 
 //-----------------------------------------------------------------------------
 // Inline shadow trace: returns 1.0 if visible, 0.0 if occluded
@@ -507,11 +511,174 @@ extern "C" __global__ void __raygen__direct_lighting() {
     const GPULight &light = params.d_lights[lightIdx];
 
     // ---------------------------------------------------------------
-    // Sky light types — CPU handles sun and ambient sky evaluation.
-    // Skip entirely on GPU to save compute time and VRAM.
+    // Sky light types — directional lights with no position.
+    // Evaluated on GPU using TraceSkyRay for shadow testing.
     // ---------------------------------------------------------------
-    if (light.type == EMIT_SKYLIGHT || light.type == EMIT_SKYAMBIENT)
+    if (light.type == EMIT_SKYLIGHT) {
+      // Sun direction = -lightNormal (sun shines in negative normal direction)
+      float3 sunDir =
+          make_float3(-light.normal_x, -light.normal_y, -light.normal_z);
+
+      // Dot product: how much the surface faces the sun
+      float dot = sampleNormal.x * sunDir.x + sampleNormal.y * sunDir.y +
+                  sampleNormal.z * sunDir.z;
+      dot = fmaxf(dot, 0.0f);
+      if (dot <= 0.0f)
+        continue;
+
+      // Offset origin along surface normal to avoid self-intersection
+      float3 offsetOrigin =
+          make_float3(samplePos.x + sampleNormal.x * GPU_DIST_EPSILON,
+                      samplePos.y + sampleNormal.y * GPU_DIST_EPSILON,
+                      samplePos.z + sampleNormal.z * GPU_DIST_EPSILON);
+
+      // Trace sky visibility — point sun or area sun
+      float totalVis = 0.0f;
+      int nSunSamples =
+          (params.sunAngularExtent > 0.0f && params.numSkyDirs > 0)
+              ? params.numSunSamples
+              : 1;
+      if (nSunSamples <= 0)
+        nSunSamples = 1;
+
+      for (int s = 0; s < nSunSamples; s++) {
+        float3 dir = sunDir;
+        if (s > 0 && params.d_skyDirs != nullptr) {
+          // Jitter sun direction using pre-computed hemisphere samples
+          // Scale by angular extent, offset from base sun direction
+          int dirIdx = (s - 1) % params.numSkyDirs;
+          float3 jitter = params.d_skyDirs[dirIdx];
+          dir.x = sunDir.x + jitter.x * params.sunAngularExtent;
+          dir.y = sunDir.y + jitter.y * params.sunAngularExtent;
+          dir.z = sunDir.z + jitter.z * params.sunAngularExtent;
+          // Normalize the jittered direction
+          float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+          if (len > 1e-6f) {
+            float invLen = 1.0f / len;
+            dir.x *= invLen;
+            dir.y *= invLen;
+            dir.z *= invLen;
+          }
+        }
+        totalVis += TraceSkyRay(offsetOrigin, dir, GPU_MAX_TRACE_LENGTH);
+      }
+
+      float seeAmount = totalVis / (float)nSunSamples;
+      if (seeAmount <= 0.0f)
+        continue;
+
+      // Accumulate: seeAmount * dot * intensity (matches CPU AddLight path)
+      float scale0 = seeAmount * dot;
+      accumR[0] += scale0 * light.intensity_x;
+      accumG[0] += scale0 * light.intensity_y;
+      accumB[0] += scale0 * light.intensity_z;
+
+      for (int n = 1; n < normalCount; n++) {
+        float bDot = bumpNormals[n].x * sunDir.x + bumpNormals[n].y * sunDir.y +
+                     bumpNormals[n].z * sunDir.z;
+        bDot = fmaxf(bDot, 0.0f);
+        float bScale = seeAmount * bDot;
+        accumR[n] += bScale * light.intensity_x;
+        accumG[n] += bScale * light.intensity_y;
+        accumB[n] += bScale * light.intensity_z;
+      }
       continue;
+    }
+
+    if (light.type == EMIT_SKYAMBIENT) {
+      // Ambient sky: sample hemisphere directions and trace for sky visibility
+      if (params.numSkyDirs <= 0 || params.d_skyDirs == nullptr)
+        continue;
+
+      float3 offsetOrigin =
+          make_float3(samplePos.x + sampleNormal.x * GPU_DIST_EPSILON,
+                      samplePos.y + sampleNormal.y * GPU_DIST_EPSILON,
+                      samplePos.z + sampleNormal.z * GPU_DIST_EPSILON);
+
+      // Accumulate weighted sky visibility across hemisphere
+      float ambientAccumR[4] = {0, 0, 0, 0};
+      float ambientAccumG[4] = {0, 0, 0, 0};
+      float ambientAccumB[4] = {0, 0, 0, 0};
+      float totalDot0 = 0.0f;
+      float possibleHitCount[4] = {0, 0, 0, 0};
+
+      for (int j = 0; j < params.numSkyDirs; j++) {
+        float3 skyDir = params.d_skyDirs[j];
+        // Negate direction (d_skyDirs points outward from sphere center,
+        // we need trace direction matching CPU's -anorm convention)
+        float3 traceDir = make_float3(-skyDir.x, -skyDir.y, -skyDir.z);
+
+        // Dot product with flat normal
+        float dot0 = sampleNormal.x * traceDir.x + sampleNormal.y * traceDir.y +
+                     sampleNormal.z * traceDir.z;
+        if (dot0 <= 1e-6f)
+          continue;
+
+        totalDot0 += dot0;
+        possibleHitCount[0] += 1.0f;
+
+        // Track per-bump possibleHitCount (CPU: only counts if BOTH flat
+        // AND bump normals have positive dot for this direction)
+        for (int n = 1; n < normalCount; n++) {
+          float bDot = bumpNormals[n].x * traceDir.x +
+                       bumpNormals[n].y * traceDir.y +
+                       bumpNormals[n].z * traceDir.z;
+          if (bDot > 1e-6f)
+            possibleHitCount[n] += 1.0f;
+        }
+
+        // Trace sky visibility
+        float vis = TraceSkyRay(offsetOrigin, traceDir, GPU_MAX_TRACE_LENGTH);
+        if (vis <= 0.0f)
+          continue;
+
+        // Accumulate: vis * dot * intensity for flat normal
+        float w0 = vis * dot0;
+        ambientAccumR[0] += w0 * light.intensity_x;
+        ambientAccumG[0] += w0 * light.intensity_y;
+        ambientAccumB[0] += w0 * light.intensity_z;
+
+        // Bump normals
+        for (int n = 1; n < normalCount; n++) {
+          float bDot = bumpNormals[n].x * traceDir.x +
+                       bumpNormals[n].y * traceDir.y +
+                       bumpNormals[n].z * traceDir.z;
+          if (bDot <= 1e-6f)
+            continue;
+          float w = vis * bDot;
+          ambientAccumR[n] += w * light.intensity_x;
+          ambientAccumG[n] += w * light.intensity_y;
+          ambientAccumB[n] += w * light.intensity_z;
+        }
+      }
+
+      // Normalize (matches CPU GatherSampleAmbientSkySSE exactly)
+      // CPU formula: result[n] = ambient_intensity[n] * possibleHitCount[0]
+      //                          / (sumdot * possibleHitCount[n]) * intensity
+      // GPU accumulators already include intensity, so:
+      //   result[0] = ambientAccum[0] / sumdot
+      //   result[n] = ambientAccum[n] * possibleHitCount[0] / (sumdot *
+      //   possibleHitCount[n])
+      if (totalDot0 > 0.0f) {
+        float invSumDot = 1.0f / totalDot0;
+        accumR[0] += ambientAccumR[0] * invSumDot;
+        accumG[0] += ambientAccumG[0] * invSumDot;
+        accumB[0] += ambientAccumB[0] * invSumDot;
+
+        for (int n = 1; n < normalCount; n++) {
+          // Scale by possibleHitCount[0]/possibleHitCount[n] to compensate
+          // for reduced hemisphere coverage of offset bump normals
+          float bumpFactor = (possibleHitCount[n] > 0.0f)
+                                 ? possibleHitCount[0] / possibleHitCount[n]
+                                 : 1.0f;
+          float factor = invSumDot * bumpFactor;
+          accumR[n] += ambientAccumR[n] * factor;
+          accumG[n] += ambientAccumG[n] * factor;
+          accumB[n] += ambientAccumB[n] * factor;
+        }
+      }
+      continue;
+    }
 
     // ---------------------------------------------------------------
     // Compute delta = lightOrigin - samplePos
@@ -713,7 +880,6 @@ extern "C" __global__ void __raygen__direct_lighting() {
       atomicAdd(&params.d_lightOutput[sampleIdx].g[n], accumG[n]);
       atomicAdd(&params.d_lightOutput[sampleIdx].b[n], accumB[n]);
     }
-    // Only write point/surface/spot light results.
-    // Sun/sky removed — CPU handles those.
+    // All light types (point/surface/spot/sky/ambient) are accumulated above.
   }
 }

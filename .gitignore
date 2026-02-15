@@ -535,3 +535,4 @@ game/mod_hl2mp
 !/game/bin/x64/test_vrad_optix_props.ps1
 /tools/benchmark/build
 /tools/textureshadows-experiment
+/.agent

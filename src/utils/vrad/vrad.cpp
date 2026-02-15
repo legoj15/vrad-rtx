@@ -10,6 +10,7 @@
 
 #include "vrad.h"
 #include "byteswap.h"
+#include "gpu_scene_data.h"
 #include "hardware_profiling.h"
 #include "leaf_ambient_lighting.h"
 #include "lightmap.h"
@@ -2284,9 +2285,113 @@ bool RadWorld_Go() {
         gpuDirectTime = Plat_FloatTime() - dlStart;
       }
 
-      // CPU supersampling + patch lights (all gradient passes, all lights)
+      // GPU kernel reuse for supersampling:
+      // Instead of iterating lights on CPU, collect qualifying sub-positions,
+      // upload them to GPU, re-launch the direct lighting kernel, and average.
       phaseStart = Plat_FloatTime();
-      RunThreadsOnIndividual(numfaces, true, FinalizeAndSupersample);
+      {
+        // Allocate sub-position buffer
+        AllocSSSubPosBuffers(numfaces);
+
+        if (g_pSSSubPositions && do_extra) {
+          for (int pass = 1; pass <= extrapasses; pass++) {
+            double passStart = Plat_FloatTime();
+
+            // Phase A: CPU — gradient detection + sub-position collection
+            //          (NO light iteration — just geometry)
+            // Inner batch loop: when the 40M sub-position buffer fills up,
+            // process what we have, reset, and re-collect until all qualifying
+            // samples are processed.
+            g_nCurrentSSPass = pass;
+            long long totalSubPosThisPass = 0;
+            int batchNum = 0;
+
+            extern volatile long g_bSSSubPosFull;
+            extern volatile long long g_nSSSubPosDropped;
+
+            do {
+              batchNum++;
+              ResetSSSubPosBuffer();
+              RunThreadsOnIndividual(numfaces, true,
+                                     SSPass_CollectSubPositions);
+
+              long long numSubPos = g_nSSSubPosCount;
+              if (numSubPos > g_nSSSubPosCapacity)
+                numSubPos = g_nSSSubPosCapacity;
+
+              bool bufferOverflowed = (g_bSSSubPosFull != 0);
+              long long dropped = g_nSSSubPosDropped;
+
+              if (bufferOverflowed && batchNum == 1) {
+                Msg("  Buffer full (%lld dropped), processing in batches...\n",
+                    dropped);
+              }
+
+              if (numSubPos > 0) {
+                // Phase B: Upload sub-positions and re-launch GPU kernel
+                Msg("  SSPass GPU: Uploading %lld sub-positions... ",
+                    numSubPos);
+                double uploadStart = Plat_FloatTime();
+
+                UploadSSSubPositions(g_pSSSubPositions, (int)numSubPos);
+                AllocateDirectLightingOutput((int)numSubPos);
+                RayTraceOptiX::UploadSkyDirections(g_SunAngularExtent);
+                RayTraceOptiX::TraceDirectLighting((int)numSubPos);
+
+                double kernelTime = Plat_FloatTime() - uploadStart;
+                Msg("%.2f s\n", kernelTime);
+
+                // Phase C: Download results and apply per-luxel averaging
+                extern GPULightOutput *g_pSSGPUOutput;
+                g_pSSGPUOutput = new GPULightOutput[numSubPos];
+                DownloadDirectLightingOutput(g_pSSGPUOutput, (int)numSubPos);
+
+                RunThreadsOnIndividual(numfaces, true, SSPass_ApplyGPUResults);
+
+                delete[] g_pSSGPUOutput;
+                g_pSSGPUOutput = nullptr;
+
+                // Restore original scene samples for next batch/pass
+                RestoreOriginalSamples();
+
+                totalSubPosThisPass += numSubPos;
+              }
+            } while (g_bSSSubPosFull != 0);
+
+            double passTime = Plat_FloatTime() - passStart;
+            if (batchNum > 1) {
+              Msg("  SS Pass %d: %lld total sub-positions (%d batches), "
+                  "%.2f s\n",
+                  pass, totalSubPosThisPass, batchNum, passTime);
+            } else {
+              Msg("  SS Pass %d: %lld sub-positions, %.2f s\n", pass,
+                  totalSubPosThisPass, passTime);
+            }
+
+            // Check if any face wants another pass
+            bool anyMorePasses = false;
+            for (int fi = 0; fi < numfaces; fi++) {
+              if (g_pSSFacePassStates &&
+                  g_pSSFacePassStates[fi].do_anotherpass) {
+                anyMorePasses = true;
+                break;
+              }
+            }
+            if (!anyMorePasses)
+              break;
+          }
+        } else {
+          // Fallback to CPU-only if buffer allocation failed
+          Warning("GPU SS unavailable, falling back to CPU.\n");
+          RunThreadsOnIndividual(numfaces, true, FinalizeAndSupersample);
+        }
+
+        // Phase D: Build patch lights + cleanup (always needed)
+        if (g_pSSSubPositions) {
+          RunThreadsOnIndividual(numfaces, true, SSPass_BuildPatchLights);
+          FreeSSSubPosBuffers();
+        }
+      }
       ssTime = Plat_FloatTime() - phaseStart;
     }
 #endif
@@ -2345,6 +2450,39 @@ bool RadWorld_Go() {
         Msg("  SS gradient: %ld qualified / %ld checked (%4.1f%%)\n",
             totalSSQualified, totalSSTotal,
             100.0 * totalSSQualified / totalSSTotal);
+      }
+
+      // Supersampling instrumentation breakdown
+      {
+        long totSSGather = 0, totSSPoints = 0;
+        int maxPass = 0;
+        double passTime[8] = {};
+        for (int t = 0; t < MAX_TOOL_THREADS; t++) {
+          totSSGather += g_nSSGatherSSECalls[t];
+          totSSPoints += g_nSSSupersamplePoints[t];
+          if (g_nSSMaxPass[t] > maxPass)
+            maxPass = g_nSSMaxPass[t];
+          for (int p = 0; p < 8; p++)
+            passTime[p] += g_flSSPassTime[t][p];
+        }
+
+        if (totSSPoints > 0 || totSSGather > 0) {
+          Msg("\nSupersampling Breakdown:\n");
+          Msg("  Supersample points:   %ld\n", totSSPoints);
+          Msg("  GatherSSE calls (SS): %ld  (%.1f lights/point)\n", totSSGather,
+              totSSPoints > 0 ? (double)totSSGather / totSSPoints : 0);
+
+          if (maxPass > 0) {
+            Msg("  Per-pass timing (%d passes):\n", maxPass);
+            double totalPassCPU = 0;
+            for (int p = 0; p < maxPass; p++)
+              totalPassCPU += passTime[p];
+            for (int p = 0; p < maxPass; p++) {
+              Msg("    Pass %d: %8.2f CPU-s  (%4.1f%%)\n", p + 1, passTime[p],
+                  totalPassCPU > 0 ? 100.0 * passTime[p] / totalPassCPU : 0);
+            }
+          }
+        }
       }
 
       // BuildFacelights sub-phase breakdown (GPU path only)

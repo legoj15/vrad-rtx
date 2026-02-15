@@ -46,8 +46,8 @@ struct GPUFaceInfo {
 // Non-bumpmapped faces only use channel [0].
 struct GPULightOutput {
   float r[4], g[4],
-      b[4]; // Per-bump-vector accumulated light (point/surface/spot only)
-  // Sun and sky are evaluated on CPU — no GPU output needed for those.
+      b[4]; // Per-bump-vector accumulated light (all types:
+            // point/surface/spot/sky/ambient)
 };
 
 //-----------------------------------------------------------------------------
@@ -73,6 +73,11 @@ void DownloadDirectLightingOutput(GPULightOutput *hostBuffer, int numSamples);
 
 // Free all GPU scene data buffers.
 void ShutdownGPUSceneData();
+
+// SS sub-position upload: replace device samples with SS sub-positions.
+// Saves the original samples for restoration after the SS pass.
+void UploadSSSubPositions(const GPUSampleData *subPositions, int count);
+void RestoreOriginalSamples();
 
 // Query uploaded counts (for diagnostics).
 int GetGPUSampleCount();

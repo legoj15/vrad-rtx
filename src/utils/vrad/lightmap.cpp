@@ -44,6 +44,17 @@ long g_nGatherSSECalls[MAX_TOOL_THREADS];
 long g_nSSGradientQualified[MAX_TOOL_THREADS];
 long g_nSSGradientTotal[MAX_TOOL_THREADS];
 
+// Supersampling instrumentation (per-thread accumulators)
+long g_nSSGatherSSECalls[MAX_TOOL_THREADS]; // GatherSampleLightSSE calls during
+                                            // SS
+long g_nSSSupersamplePoints[MAX_TOOL_THREADS]; // Total supersample points
+                                               // evaluated
+double g_flSSPassTime[MAX_TOOL_THREADS]
+                     [8];           // Per-pass wall time (up to 8 passes)
+int g_nSSMaxPass[MAX_TOOL_THREADS]; // Highest pass number reached
+double g_flSSShadowRayTime[MAX_TOOL_THREADS]; // Time in TestLine during SS
+long g_nSSShadowRayCalls[MAX_TOOL_THREADS];   // TestLine calls during SS
+
 // BuildFacelights sub-phase timing (per-thread accumulators, seconds)
 double g_flBFL_Setup[MAX_TOOL_THREADS]; // InitLightinfo + CalcPoints +
                                         // InitSampleInfo
@@ -51,6 +62,108 @@ double g_flBFL_IllumNormals
     [MAX_TOOL_THREADS]; // ComputeIlluminationPointAndNormalsSSE
 double g_flBFL_SkyGather[MAX_TOOL_THREADS]; // GatherSampleLight_CollectGPURays
 long g_nBFL_FacesProcessed[MAX_TOOL_THREADS];
+
+#ifdef VRAD_RTX_CUDA_SUPPORT
+//==========================================================================
+// GPU Kernel Reuse for Supersampling — globals and buffer management
+//==========================================================================
+
+#include "gpu_scene_data.h"
+
+GPUSampleData *g_pSSSubPositions = nullptr;
+volatile long long g_nSSSubPosCount = 0;
+long long g_nSSSubPosCapacity = 0;
+SSFacePassState *g_pSSFacePassStates = nullptr;
+int g_nCurrentSSPass = 0;
+volatile long g_bSSSubPosFull = 0;
+volatile long long g_nSSSubPosDropped = 0;
+
+void AllocSSSubPosBuffers(int numFaces) {
+  // Each qualifying sample generates up to ~16 sub-positions (4x4 grid).
+  // For a map with 28M samples, ~10% qualify → 2.8M × 16 = ~45M sub-positions.
+  // GPUSampleData is 48 bytes each → 120M × 48 = ~5.5 GB.
+  // The fallback loop below halves capacity if allocation fails.
+  g_nSSSubPosCapacity = 120000000LL;
+
+  while (g_nSSSubPosCapacity > 1000000LL) {
+    g_pSSSubPositions =
+        (GPUSampleData *)malloc(g_nSSSubPosCapacity * sizeof(GPUSampleData));
+    if (g_pSSSubPositions)
+      break;
+    g_nSSSubPosCapacity /= 2;
+    Warning("AllocSSSubPosBuffers: reducing capacity to %lld\n",
+            g_nSSSubPosCapacity);
+  }
+
+  if (!g_pSSSubPositions) {
+    Warning("AllocSSSubPosBuffers: FAILED to allocate buffer!\n");
+    g_nSSSubPosCapacity = 0;
+    return;
+  }
+
+  g_pSSFacePassStates = new SSFacePassState[numFaces];
+  g_nSSSubPosCount = 0;
+
+  Msg("AllocSSSubPosBuffers: %lld sub-position capacity (%.1f MB)\n",
+      g_nSSSubPosCapacity,
+      g_nSSSubPosCapacity * sizeof(GPUSampleData) / (1024.0 * 1024.0));
+}
+
+void FreeSSSubPosBuffers() {
+  if (g_pSSSubPositions) {
+    free(g_pSSSubPositions);
+    g_pSSSubPositions = nullptr;
+  }
+  if (g_pSSFacePassStates) {
+    extern int numfaces;
+    for (int i = 0; i < numfaces; i++) {
+      if (g_pSSFacePassStates[i].qualified) {
+        free(g_pSSFacePassStates[i].qualified);
+        g_pSSFacePassStates[i].qualified = nullptr;
+      }
+      if (g_pSSFacePassStates[i].pSampleIntensity) {
+        free(g_pSSFacePassStates[i].pSampleIntensity);
+        g_pSSFacePassStates[i].pSampleIntensity = nullptr;
+      }
+      if (g_pSSFacePassStates[i].pHasProcessedSample) {
+        free(g_pSSFacePassStates[i].pHasProcessedSample);
+        g_pSSFacePassStates[i].pHasProcessedSample = nullptr;
+      }
+    }
+    delete[] g_pSSFacePassStates;
+    g_pSSFacePassStates = nullptr;
+  }
+  g_nSSSubPosCapacity = 0;
+  g_nSSSubPosCount = 0;
+}
+
+void ResetSSSubPosBuffer() {
+  g_nSSSubPosCount = 0;
+  g_bSSSubPosFull = 0;
+  g_nSSSubPosDropped = 0;
+}
+
+long long AllocSSSubPositions(int count) {
+  if (g_bSSSubPosFull) {
+    InterlockedExchangeAdd64((volatile long long *)&g_nSSSubPosDropped, count);
+    return -1;
+  }
+  for (;;) {
+    long long current = InterlockedCompareExchange64(
+        (volatile long long *)&g_nSSSubPosCount, 0, 0);
+    if (current + count > g_nSSSubPosCapacity) {
+      InterlockedExchange(&g_bSSSubPosFull, 1);
+      InterlockedExchangeAdd64((volatile long long *)&g_nSSSubPosDropped,
+                               count);
+      return -1;
+    }
+    long long prev = InterlockedCompareExchange64(
+        (volatile long long *)&g_nSSSubPosCount, current + count, current);
+    if (prev == current)
+      return current;
+  }
+}
+#endif // VRAD_RTX_CUDA_SUPPORT
 
 #define SMOOTHING_GROUP_HARD_EDGE 0xff000000
 
@@ -2545,59 +2658,41 @@ static void ComputeIlluminationPointAndNormalsSSE(lightinfo_t const &l,
 
 #ifdef VRAD_RTX_CUDA_SUPPORT
 //-----------------------------------------------------------------------------
-// GPU path: gather sky/ambient lights only.
-// Standard lights (point, surface, spot) are handled by the GPU direct
-// lighting kernel. This function iterates only g_SkyLights[] (typically 1-5
-// lights) instead of the full per-cluster list (avg 119 lights), eliminating
-// 98%+ of wasted iterations.
+// GPU path: store sunAmount for EMIT_SKYLIGHT only.
+// The GPU kernel now handles sky/ambient RGB lighting directly.
+// This function only evaluates EMIT_SKYLIGHT to extract m_flDirectSunAmount
+// (sun visibility fraction), which the GPU doesn't output.
+// EMIT_SKYAMBIENT has no sunAmount, so it's skipped entirely.
 //-----------------------------------------------------------------------------
 static void GatherSampleLight_CollectGPURays(SSE_SampleInfo_t &info,
                                              int sampleIdx, int numSamples,
                                              int iThread) {
   SSE_sampleLightOutput_t out;
 
-  // Iterate only sky/ambient lights — no per-cluster lookup needed since
-  // sky lights are global (PVS-visible from everywhere by definition).
   for (int li = 0; li < g_nSkyLights; li++) {
     directlight_t *dl = g_SkyLights[li];
 
-    // Sky lights (emit_skylight, emit_skyambient) are computed fully on CPU.
+    // Only EMIT_SKYLIGHT produces sunAmount; ambient sky has none
+    if (dl->light.type != emit_skylight)
+      continue;
+
     GatherSampleLightSSE(out, dl, info.m_FaceNum, info.m_Points,
                          info.m_PointNormals, info.m_NormalCount,
                          info.m_iThread);
     g_nGatherSSECalls[iThread]++;
 
-    fltx4 fxdot[NUM_BUMP_VECTS + 1];
-    bool skipLight = true;
-    for (int b = 0; b < info.m_NormalCount; b++) {
-      fxdot[b] = MulSIMD(out.m_flDot[b], out.m_flFalloff);
-      if (!IsAllZeros(fxdot[b]))
-        skipLight = false;
-    }
-    if (skipLight) {
-      g_nLightsSkippedZeroDot[iThread]++;
-      continue;
-    }
-
     int lightStyleIndex = FindOrAllocateLightstyleSamples(
         info.m_pFace, info.m_pFaceLight, dl->light.style, info.m_NormalCount);
-    if (lightStyleIndex < 0) {
-      if (info.m_WarnFace != info.m_FaceNum) {
-        Warning("\nWARNING: Too many light styles on a face at (%f, %f, %f)\n",
-                info.m_Points.x.m128_f32[0], info.m_Points.y.m128_f32[0],
-                info.m_Points.z.m128_f32[0]);
-        info.m_WarnFace = info.m_FaceNum;
-      }
+    if (lightStyleIndex < 0)
       continue;
-    }
 
     LightingValue_t **pLightmaps = info.m_pFaceLight->light[lightStyleIndex];
 
+    // Store only sunAmount — GPU handles the RGB contribution
     for (int n = 0; n < info.m_NormalCount; ++n) {
       for (int i = 0; i < numSamples; i++) {
-        pLightmaps[n][sampleIdx + i].AddLight(SubFloat(fxdot[n], i),
-                                              dl->light.intensity,
-                                              SubFloat(out.m_flSunAmount, i));
+        pLightmaps[n][sampleIdx + i].m_flDirectSunAmount +=
+            SubFloat(out.m_flSunAmount, i);
       }
     }
   }
@@ -2866,6 +2961,7 @@ ResampleLightAt4Points(SSE_SampleInfo_t &info, int lightStyleIndex, int flags,
     // (tested by checking the dot product of the face normal and the light
     // position) we don't want it to contribute to *any* of the bumped
     // lightmaps. It glows in disturbing ways if we don't do this.
+    g_nSSGatherSSECalls[info.m_iThread]++;
     GatherSampleLightSSE(out, dl, info.m_FaceNum, info.m_Points,
                          info.m_PointNormals, info.m_NormalCount,
                          info.m_iThread);
@@ -3166,6 +3262,8 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
   bool do_anotherpass = true;
   int pass = 1;
   while (do_anotherpass && pass <= extrapasses) {
+    double tPassStart = Plat_FloatTime();
+
     // Look for lighting discontinuities to see what we should be
     // supersampling
     ComputeLightmapGradients(info, pHasProcessedSample, pSampleIntensity,
@@ -3187,6 +3285,7 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
         continue;
 
       g_nSSGradientQualified[info.m_iThread]++;
+      g_nSSSupersamplePoints[info.m_iThread]++;
 
       // Joy! We're supersampling now, and we therefore must do another pass
       // Also, we need never bother with this sample again
@@ -3227,6 +3326,15 @@ static void BuildSupersampleFaceLights(lightinfo_t &l, SSE_SampleInfo_t &info,
         // Recompute the luxel intensity based on the supersampling
         ComputeLuxelIntensity(info, i, ppLightSamples, pSampleIntensity);
       }
+    }
+
+    // Record per-pass timing
+    double tPassEnd = Plat_FloatTime();
+    int passIdx = pass - 1;
+    if (passIdx < 8) {
+      g_flSSPassTime[info.m_iThread][passIdx] += (tPassEnd - tPassStart);
+      if (pass > g_nSSMaxPass[info.m_iThread])
+        g_nSSMaxPass[info.m_iThread] = pass;
     }
 
     // We've finished another pass
@@ -3291,6 +3399,400 @@ void FinalizeAndSupersample(int iThread, int facenum) {
     FreeSampleWindings(fl);
   }
 }
+
+//==========================================================================
+// GPU Kernel Reuse for Supersampling — Phase Functions
+//==========================================================================
+
+//==========================================================================
+// Phase A: Collect Sub-Positions — CPU threaded, per-face
+//
+// For each face, detect gradients and collect world-space sub-positions
+// for qualifying samples. Stores them as GPUSampleData in a global buffer
+// for batch upload to GPU. NO light iteration happens here.
+//==========================================================================
+void SSPass_CollectSubPositions(int iThread, int facenum) {
+  lightinfo_t l;
+  InitLightinfo(&l, facenum);
+
+  dface_t *f = &g_pFaces[facenum];
+  facelight_t *fl = &facelight[facenum];
+
+  if (f->styles[0] == 255 || fl->numsamples == 0)
+    return;
+  if (texinfo[f->texinfo].flags & TEX_SPECIAL)
+    return;
+
+  SSE_SampleInfo_t sampleInfo;
+  InitSampleInfo(l, iThread, sampleInfo);
+
+  if (sampleInfo.m_IsDispFace)
+    return;
+
+  SSFacePassState &state = g_pSSFacePassStates[facenum];
+  int pass = g_nCurrentSSPass;
+
+  // On first pass, allocate persistent state
+  if (pass == 1) {
+    state.faceIndex = facenum;
+    state.pass = 1;
+    state.do_anotherpass = true;
+
+    int lmSize = sampleInfo.m_LightmapSize;
+    state.pHasProcessedSample = (bool *)calloc(lmSize, sizeof(bool));
+    state.pSampleIntensity =
+        (float *)malloc(sampleInfo.m_NormalCount * lmSize * sizeof(float));
+  }
+
+  // Reset qualified count each pass — stale data from previous passes
+  // would cause SSPass_ApplyGPUResults to access out-of-bounds indices
+  state.numQualified = 0;
+
+  if (!state.do_anotherpass || pass > extrapasses)
+    return;
+
+  // Process each lightstyle
+  for (int lstyle = 0; lstyle < MAXLIGHTMAPS; ++lstyle) {
+    if (f->styles[lstyle] == 255)
+      break;
+
+    state.lightstyleIndex = lstyle;
+    LightingValue_t **ppLightSamples = fl->light[lstyle];
+
+    // Compute intensities for gradient detection
+    for (int i = 0; i < fl->numsamples; i++) {
+      sample_t &sample = fl->sample[i];
+      int destIdx = sample.s + sample.t * sampleInfo.m_LightmapWidth;
+      for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+        float intensity = ppLightSamples[n][i].Intensity();
+        state.pSampleIntensity[n * sampleInfo.m_LightmapSize + destIdx] =
+            pow(intensity / 256.0, 1.0 / 2.2);
+      }
+    }
+
+    // Compute gradients
+    float *pGradient = (float *)_alloca(fl->numsamples * sizeof(float));
+    int w = sampleInfo.m_LightmapWidth;
+    int h = sampleInfo.m_LightmapHeight;
+    for (int i = 0; i < fl->numsamples; i++) {
+      if (state.pHasProcessedSample[i]) {
+        pGradient[i] = 0;
+        continue;
+      }
+      pGradient[i] = 0.0f;
+      sample_t &sample = fl->sample[i];
+      for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+        int j = n * sampleInfo.m_LightmapSize + sample.s + sample.t * w;
+        float *pI = state.pSampleIntensity;
+        if (sample.t > 0) {
+          if (sample.s > 0)
+            pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j - 1 - w]));
+          pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j - w]));
+          if (sample.s < w - 1)
+            pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j + 1 - w]));
+        }
+        if (sample.t < h - 1) {
+          if (sample.s > 0)
+            pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j - 1 + w]));
+          pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j + w]));
+          if (sample.s < w - 1)
+            pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j + 1 + w]));
+        }
+        if (sample.s > 0)
+          pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j - 1]));
+        if (sample.s < w - 1)
+          pGradient[i] = max(pGradient[i], fabs(pI[j] - pI[j + 1]));
+      }
+    }
+
+    // Count qualifying samples
+    state.do_anotherpass = false;
+    int numQualified = 0;
+    for (int i = 0; i < fl->numsamples; ++i) {
+      if (pGradient[i] >= 0.0625f) {
+        if (pGradient[i] >= 0.125f)
+          state.do_anotherpass = true;
+        numQualified++;
+      }
+    }
+
+    if (numQualified == 0)
+      continue;
+
+    // Allocate qualified sample array
+    if (state.qualified)
+      free(state.qualified);
+    state.qualified = (SSFacePassState::QualifiedSample *)malloc(
+        numQualified * sizeof(SSFacePassState::QualifiedSample));
+    state.numQualified = numQualified;
+
+    // Collect sub-positions for each qualifying sample
+    int qi = 0;
+    for (int i = 0; i < fl->numsamples; ++i) {
+      if (pGradient[i] < 0.0625f)
+        continue;
+
+      sample_t &sample = fl->sample[i];
+      SSFacePassState::QualifiedSample &qs = state.qualified[qi++];
+      qs.sampleIndex = i;
+      qs.subsampleCount = 0;
+      qs.gpuSubPosOffset = -1;
+      qs.gpuSubPosCount = 0;
+
+      // Get the position of the original sample in lightmap space
+      Vector2D temp;
+      WorldToLuxelSpace(&l, sample.pos, temp);
+      Vector sampleLightOrigin(temp[0], temp[1], 0.0f);
+
+      FourVectors superSampleNormal;
+      superSampleNormal.DuplicateVector(sample.normal);
+      FourVectors superSampleLightCoord;
+      FourVectors superSamplePosition;
+
+      // Temp buffer: max 4×4 (direct) + 4 (ambient) = 20 sub-positions
+      GPUSampleData tempSubPos[20];
+      int tempCount = 0;
+
+      // Collect direct (NON_AMBIENT_ONLY) sub-positions: 4x4 grid
+      {
+        float sampleWidth = 4.0f;
+        float cscale = 1.0f / sampleWidth;
+        float csshift = -((sampleWidth - 1) * cscale) / 2.0f;
+
+        float aRow[4];
+        for (int coord = 0; coord < 4; ++coord)
+          aRow[coord] = csshift + coord * cscale;
+        fltx4 sseRow = LoadUnalignedSIMD(aRow);
+
+        for (int s = 0; s < 4; ++s) {
+          superSampleLightCoord.DuplicateVector(sampleLightOrigin);
+          superSampleLightCoord.x =
+              AddSIMD(superSampleLightCoord.x, ReplicateX4(aRow[s]));
+          superSampleLightCoord.y = AddSIMD(superSampleLightCoord.y, sseRow);
+
+          LuxelSpaceToWorld(&l, superSampleLightCoord[0],
+                            superSampleLightCoord[1], superSamplePosition);
+
+          int invalidBits = 0;
+          if (sample.w &&
+              !PointsInWinding(superSamplePosition, sample.w, invalidBits))
+            continue;
+
+          ComputeIlluminationPointAndNormalsSSE(
+              l, superSamplePosition, superSampleNormal, &sampleInfo, 4);
+
+          for (int lane = 0; lane < 4; ++lane) {
+            if ((invalidBits >> lane) & 0x1)
+              continue;
+
+            GPUSampleData &gpu = tempSubPos[tempCount];
+            gpu.position.x = SubFloat(sampleInfo.m_Points.x, lane);
+            gpu.position.y = SubFloat(sampleInfo.m_Points.y, lane);
+            gpu.position.z = SubFloat(sampleInfo.m_Points.z, lane);
+            gpu.normal.x = SubFloat(sampleInfo.m_PointNormals[0].x, lane);
+            gpu.normal.y = SubFloat(sampleInfo.m_PointNormals[0].y, lane);
+            gpu.normal.z = SubFloat(sampleInfo.m_PointNormals[0].z, lane);
+            gpu.faceIndex = facenum;
+            gpu.sampleIndex = i;
+            gpu.clusterIndex = ClusterFromPoint(
+                Vector(gpu.position.x, gpu.position.y, gpu.position.z));
+            gpu.pad0 = 0;
+            tempCount++;
+          }
+        }
+      }
+
+      // Collect ambient (AMBIENT_ONLY) sub-positions: 2x2 grid
+      {
+        float sampleWidth = 2.0f;
+        float cscale = 1.0f / sampleWidth;
+        float csshift = -((sampleWidth - 1) * cscale) / 2.0f;
+
+        FourVectors superSampleOffsets;
+        superSampleOffsets.LoadAndSwizzle(
+            Vector(csshift, csshift, 0), Vector(csshift, csshift + cscale, 0),
+            Vector(csshift + cscale, csshift, 0),
+            Vector(csshift + cscale, csshift + cscale, 0));
+        superSampleLightCoord.DuplicateVector(sampleLightOrigin);
+        superSampleLightCoord += superSampleOffsets;
+
+        LuxelSpaceToWorld(&l, superSampleLightCoord[0],
+                          superSampleLightCoord[1], superSamplePosition);
+
+        int invalidBits = 0;
+        if (sample.w &&
+            !PointsInWinding(superSamplePosition, sample.w, invalidBits)) {
+          // Ambient winding check failed — but still allocate direct
+          // sub-positions
+        } else {
+          ComputeIlluminationPointAndNormalsSSE(
+              l, superSamplePosition, superSampleNormal, &sampleInfo, 4);
+
+          for (int lane = 0; lane < 4; ++lane) {
+            if ((invalidBits >> lane) & 0x1)
+              continue;
+
+            GPUSampleData &gpu = tempSubPos[tempCount];
+            gpu.position.x = SubFloat(sampleInfo.m_Points.x, lane);
+            gpu.position.y = SubFloat(sampleInfo.m_Points.y, lane);
+            gpu.position.z = SubFloat(sampleInfo.m_Points.z, lane);
+            gpu.normal.x = SubFloat(sampleInfo.m_PointNormals[0].x, lane);
+            gpu.normal.y = SubFloat(sampleInfo.m_PointNormals[0].y, lane);
+            gpu.normal.z = SubFloat(sampleInfo.m_PointNormals[0].z, lane);
+            gpu.faceIndex = facenum;
+            gpu.sampleIndex = i;
+            gpu.clusterIndex = ClusterFromPoint(
+                Vector(gpu.position.x, gpu.position.y, gpu.position.z));
+            gpu.pad0 = 0;
+            tempCount++;
+          }
+        }
+      }
+
+      // Single contiguous allocation for all sub-positions of this sample
+      if (tempCount > 0) {
+        long long slot = AllocSSSubPositions(tempCount);
+        if (slot >= 0) {
+          memcpy(&g_pSSSubPositions[slot], tempSubPos,
+                 tempCount * sizeof(GPUSampleData));
+          qs.gpuSubPosOffset = (int)slot;
+          qs.gpuSubPosCount = tempCount;
+          qs.subsampleCount = tempCount;
+          state.pHasProcessedSample[i] = true;
+        }
+        // If allocation failed (buffer full), don't mark as processed —
+        // this sample will be retried in the next batch.
+      } else {
+        state.pHasProcessedSample[i] = true;
+      }
+    }
+  }
+}
+
+//==========================================================================
+// Phase C: Apply GPU Results — CPU threaded, per-face
+//
+// Reads GPULightOutput for SS sub-positions and averages them
+// per qualifying sample, replacing the original lightmap value.
+//==========================================================================
+
+// Global pointer set by the pass loop before calling this function
+GPULightOutput *g_pSSGPUOutput = nullptr;
+
+void SSPass_ApplyGPUResults(int iThread, int facenum) {
+  dface_t *f = &g_pFaces[facenum];
+  facelight_t *fl = &facelight[facenum];
+
+  if (f->styles[0] == 255 || fl->numsamples == 0)
+    return;
+  if (texinfo[f->texinfo].flags & TEX_SPECIAL)
+    return;
+
+  SSE_SampleInfo_t sampleInfo;
+  lightinfo_t l;
+  InitLightinfo(&l, facenum);
+  InitSampleInfo(l, iThread, sampleInfo);
+
+  if (sampleInfo.m_IsDispFace)
+    return;
+
+  SSFacePassState &state = g_pSSFacePassStates[facenum];
+  if (state.numQualified == 0 || !state.qualified)
+    return;
+
+  int lstyle = state.lightstyleIndex;
+  LightingValue_t **ppLightSamples = fl->light[lstyle];
+
+  for (int qi = 0; qi < state.numQualified; ++qi) {
+    SSFacePassState::QualifiedSample &qs = state.qualified[qi];
+    int i = qs.sampleIndex;
+
+    if (qs.gpuSubPosCount <= 0 || qs.gpuSubPosOffset < 0)
+      continue;
+
+    // Accumulate GPU results for all sub-positions of this sample
+    LightingValue_t accum[NUM_BUMP_VECTS + 1];
+    for (int n = 0; n < sampleInfo.m_NormalCount; ++n)
+      accum[n].Zero();
+
+    for (int sp = 0; sp < qs.gpuSubPosCount; ++sp) {
+      int globalIdx = qs.gpuSubPosOffset + sp;
+      const GPULightOutput &out = g_pSSGPUOutput[globalIdx];
+      for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+        accum[n].m_vecLighting.x += out.r[n];
+        accum[n].m_vecLighting.y += out.g[n];
+        accum[n].m_vecLighting.z += out.b[n];
+      }
+    }
+
+    // Average the GPU sub-position results
+    float invCount = 1.0f / (float)qs.subsampleCount;
+
+    // Replace ONLY the GPU point-light portion of the sample's lighting.
+    // fl.light = CPU contributions (sun/sky) + GPU point contributions.
+    // We subtract the original single-sample GPU result (gpu_point) and
+    // add the averaged multi-sample GPU result from SS sub-positions.
+    for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+      if (ppLightSamples[n] && fl->gpu_point[lstyle][n]) {
+        float oldGPU_r = fl->gpu_point[lstyle][n][i].m_vecLighting.x;
+        float oldGPU_g = fl->gpu_point[lstyle][n][i].m_vecLighting.y;
+        float oldGPU_b = fl->gpu_point[lstyle][n][i].m_vecLighting.z;
+
+        float newGPU_r = accum[n].m_vecLighting.x * invCount;
+        float newGPU_g = accum[n].m_vecLighting.y * invCount;
+        float newGPU_b = accum[n].m_vecLighting.z * invCount;
+
+        ppLightSamples[n][i].m_vecLighting.x += (newGPU_r - oldGPU_r);
+        ppLightSamples[n][i].m_vecLighting.y += (newGPU_g - oldGPU_g);
+        ppLightSamples[n][i].m_vecLighting.z += (newGPU_b - oldGPU_b);
+
+        fl->gpu_point[lstyle][n][i].m_vecLighting.x = newGPU_r;
+        fl->gpu_point[lstyle][n][i].m_vecLighting.y = newGPU_g;
+        fl->gpu_point[lstyle][n][i].m_vecLighting.z = newGPU_b;
+      }
+    }
+
+    // Sky lights are now handled by the GPU kernel — the GPU output in
+    // accum[] already includes sky/ambient contributions. The delta
+    // (newGPU - oldGPU) automatically captures supersampled sky improvement.
+  }
+
+  // Update intensities for next pass gradient detection
+  for (int i = 0; i < fl->numsamples; i++) {
+    sample_t &sample = fl->sample[i];
+    int destIdx = sample.s + sample.t * sampleInfo.m_LightmapWidth;
+    for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
+      float intensity = ppLightSamples[n][i].Intensity();
+      state.pSampleIntensity[n * sampleInfo.m_LightmapSize + destIdx] =
+          pow(intensity / 256.0, 1.0 / 2.2);
+    }
+  }
+}
+
+//==========================================================================
+// Phase D: Build Patch Lights + Cleanup — CPU threaded, per-face
+//==========================================================================
+void SSPass_BuildPatchLights(int iThread, int facenum) {
+  dface_t *f = &g_pFaces[facenum];
+  if (f->styles[0] == 255)
+    return;
+  if (texinfo[f->texinfo].flags & TEX_SPECIAL)
+    return;
+  if (g_FacePatches.Element(facenum) == g_FacePatches.InvalidIndex())
+    return;
+
+  facelight_t *fl = &facelight[facenum];
+  if (fl->numsamples == 0)
+    return;
+
+  BuildPatchLights(facenum);
+  if (g_bDumpPatches) {
+    DumpSamples(facenum, fl);
+  } else {
+    FreeSampleWindings(fl);
+  }
+}
+
 #endif // VRAD_RTX_CUDA_SUPPORT
 
 void InitLightinfo(lightinfo_t *pl, int facenum) {

@@ -162,6 +162,14 @@ extern long g_nGatherSSECalls[MAX_TOOL_THREADS];
 extern long g_nSSGradientQualified[MAX_TOOL_THREADS];
 extern long g_nSSGradientTotal[MAX_TOOL_THREADS];
 
+// Supersampling instrumentation (per-thread accumulators)
+extern long g_nSSGatherSSECalls[MAX_TOOL_THREADS];
+extern long g_nSSSupersamplePoints[MAX_TOOL_THREADS];
+extern double g_flSSPassTime[MAX_TOOL_THREADS][8];
+extern int g_nSSMaxPass[MAX_TOOL_THREADS];
+extern double g_flSSShadowRayTime[MAX_TOOL_THREADS];
+extern long g_nSSShadowRayCalls[MAX_TOOL_THREADS];
+
 // BuildFacelights sub-phase timing (per-thread accumulators)
 extern double g_flBFL_Setup[MAX_TOOL_THREADS];
 extern double g_flBFL_IllumNormals[MAX_TOOL_THREADS];
@@ -174,6 +182,68 @@ void BuildGPUSceneData();
 void ShutdownGPUSceneDataBridge();
 void LaunchGPUDirectLighting();
 void DownloadAndApplyGPUResults();
+
+//==========================================================================
+// GPU Kernel Reuse for Supersampling
+//
+// Instead of deferring shadow rays and iterating lights on CPU, we collect
+// sub-positions, upload them as GPUSampleData, and re-launch the existing
+// TraceDirectLighting kernel. This eliminates CPU light iteration overhead.
+//==========================================================================
+
+// Per-face intermediate state for the SS pass.
+// Tracks which samples qualified and which GPU sub-position indices
+// correspond to each sample for averaging.
+struct SSFacePassState {
+  struct QualifiedSample {
+    int sampleIndex;
+    int subsampleCount;  // How many valid sub-positions were collected
+    int gpuSubPosOffset; // Start index into global GPU sub-position array
+    int gpuSubPosCount;  // Number of sub-positions for this sample
+  };
+
+  int faceIndex;
+  int lightstyleIndex;
+  int numQualified;
+  QualifiedSample *qualified; // heap-allocated per face
+
+  // Per-sample intensity + gradient data for recomputing after apply
+  float *pSampleIntensity; // allocated per face
+  bool *pHasProcessedSample;
+  int pass; // current pass number
+  bool do_anotherpass;
+
+  SSFacePassState()
+      : faceIndex(-1), lightstyleIndex(0), numQualified(0), qualified(nullptr),
+        pSampleIntensity(nullptr), pHasProcessedSample(nullptr), pass(0),
+        do_anotherpass(false) {}
+};
+
+// Per-face pass state (indexed by face number)
+extern SSFacePassState *g_pSSFacePassStates;
+
+// Current SS pass number (set before each RunThreadsOnIndividual call)
+extern int g_nCurrentSSPass;
+
+// Global sub-position buffer for GPU upload
+struct GPUSampleData; // forward declare (defined in gpu_scene_data.h)
+extern GPUSampleData *g_pSSSubPositions;
+extern volatile long long g_nSSSubPosCount;
+extern long long g_nSSSubPosCapacity;
+
+// Buffer management
+void AllocSSSubPosBuffers(int numFaces);
+void FreeSSSubPosBuffers();
+void ResetSSSubPosBuffer();
+
+// Thread-safe sub-position allocation: returns start index
+long long AllocSSSubPositions(int count);
+
+// SS pass functions
+void SSPass_CollectSubPositions(int iThread, int facenum);
+void SSPass_ApplyGPUResults(int iThread, int facenum);
+void SSPass_BuildPatchLights(int iThread, int facenum);
+
 #endif
 
 #endif // LIGHTMAP_H

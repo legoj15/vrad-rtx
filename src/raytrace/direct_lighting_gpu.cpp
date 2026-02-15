@@ -290,4 +290,40 @@ GPUClusterLightList *GetDeviceClusterLightLists() {
 int *GetDeviceClusterLightIndices() { return s_deviceClusterLightIndices; }
 GPULightOutput *GetDeviceDirectLightingOutput() { return s_deviceLightOutput; }
 
+//=============================================================================
+// SS Sub-Position Upload — saves/restores original scene samples
+//=============================================================================
+static GPUSampleData *s_savedOriginalSamples = nullptr;
+static int s_savedOriginalSampleCount = 0;
+
+void UploadSSSubPositions(const GPUSampleData *subPositions, int count) {
+  // Save original device samples pointer (first time only)
+  if (!s_savedOriginalSamples) {
+    s_savedOriginalSamples = s_deviceSamples;
+    s_savedOriginalSampleCount = s_numSamples;
+  } else {
+    // Free previous SS upload (but not the saved original)
+    if (s_deviceSamples && s_deviceSamples != s_savedOriginalSamples) {
+      cudaFree(s_deviceSamples);
+    }
+  }
+
+  // Upload SS sub-positions as the new device samples
+  s_deviceSamples = CudaUpload(subPositions, count, "SSSubPositions");
+  s_numSamples = count;
+}
+
+void RestoreOriginalSamples() {
+  if (s_savedOriginalSamples) {
+    // Free the current SS samples (if different from original)
+    if (s_deviceSamples && s_deviceSamples != s_savedOriginalSamples) {
+      cudaFree(s_deviceSamples);
+    }
+    s_deviceSamples = s_savedOriginalSamples;
+    s_numSamples = s_savedOriginalSampleCount;
+    s_savedOriginalSamples = nullptr;
+    s_savedOriginalSampleCount = 0;
+  }
+}
+
 #endif // VRAD_RTX_CUDA_SUPPORT
