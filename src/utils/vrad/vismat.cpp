@@ -520,10 +520,45 @@ transfer_t *BuildVisLeafs_Start() {
   return (transfer_t *)calloc(1, MAX_PATCHES * sizeof(transfer_t));
 }
 
-// Maximum number of rays to accumulate per GPU batch before flushing.
-// 2M rays × 36 bytes = ~72 MB per thread — well within RAM budget while
-// keeping GPU batches large enough for good utilization.
-#define MAX_GPU_RAY_BATCH (2 * 1024 * 1024)
+// Auto-scaled GPU ray batch size based on available physical RAM.
+// Each ray in the batch costs ~72 bytes (RayBatch + PatchPair + RayResult).
+// With 12+ threads, large batches can create significant commit pressure.
+// Scale from 256K (tight RAM) to 2M (plenty of RAM).
+static int GetAutoScaledGPURayBatch() {
+  static int s_cachedBatch = 0;
+  if (s_cachedBatch > 0)
+    return s_cachedBatch;
+
+  // Default: 2M rays per batch
+  s_cachedBatch = 2 * 1024 * 1024;
+
+#ifdef _WIN32
+  MEMORYSTATUSEX memInfo;
+  memInfo.dwLength = sizeof(memInfo);
+  if (GlobalMemoryStatusEx(&memInfo)) {
+    unsigned long long availGB = memInfo.ullAvailPhys / (1024ULL * 1024 * 1024);
+    if (availGB < 8) {
+      s_cachedBatch = 256 * 1024; // 256K rays - ~18 MB per thread
+      Msg("GPU ray batch: 256K (%.1f GB RAM available)\n",
+          (float)memInfo.ullAvailPhys / (1024.0f * 1024 * 1024));
+    } else if (availGB < 16) {
+      s_cachedBatch = 512 * 1024; // 512K rays - ~36 MB per thread
+      Msg("GPU ray batch: 512K (%.1f GB RAM available)\n",
+          (float)memInfo.ullAvailPhys / (1024.0f * 1024 * 1024));
+    } else if (availGB < 32) {
+      s_cachedBatch = 1024 * 1024; // 1M rays - ~72 MB per thread
+      Msg("GPU ray batch: 1M (%.1f GB RAM available)\n",
+          (float)memInfo.ullAvailPhys / (1024.0f * 1024 * 1024));
+    } else {
+      Msg("GPU ray batch: 2M (%.1f GB RAM available)\n",
+          (float)memInfo.ullAvailPhys / (1024.0f * 1024 * 1024));
+    }
+  }
+#endif
+
+  return s_cachedBatch;
+}
+#define MAX_GPU_RAY_BATCH GetAutoScaledGPURayBatch()
 
 // If PatchCB is non-null, it is called after each row is generated (used by
 // MPI).

@@ -38,6 +38,9 @@ struct GPULight {
   float startFadeDistance;
   float endFadeDistance;
   float capDist;
+
+  // Lightstyle index (0 = always-on, 1-63 = named/switchable)
+  int style;
 };
 
 // Shadow ray for direct lighting

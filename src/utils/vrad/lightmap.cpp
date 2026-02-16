@@ -27,6 +27,10 @@
 #include "tier1/utlbuffer.h"
 #include "tier1/utlrbtree.h"
 
+// Thread-safe counter for degenerate face vector warnings (suppresses per-face
+// spam)
+static volatile long g_nParallelFaceVectorWarnings = 0;
+
 enum {
   AMBIENT_ONLY = 0x1,
   NON_AMBIENT_ONLY = 0x2,
@@ -556,8 +560,7 @@ void CalcFaceVectors(lightinfo_t *l) {
 
   float det = -DotProduct(l->facenormal, luxelSpaceCross);
   if (fabs(det) < 1.0e-20) {
-    Warning(" warning - face vectors parallel to face normal. bad lighting "
-            "will be produced\n");
+    InterlockedIncrement(&g_nParallelFaceVectorWarnings);
     l->luxelOrigin = vec3_origin;
   } else {
     // invert the matrix
@@ -2582,8 +2585,8 @@ static inline int FindLightstyle(dface_t *f, int lightstyle) {
   return -1;
 }
 
-static int FindOrAllocateLightstyleSamples(dface_t *f, facelight_t *fl,
-                                           int lightstyle, int numnormals) {
+int FindOrAllocateLightstyleSamples(dface_t *f, facelight_t *fl, int lightstyle,
+                                    int numnormals) {
   // Search the lightstyles associated with the face for a match
   int k;
   for (k = 0; k < MAXLIGHTMAPS; k++) {
@@ -3718,10 +3721,26 @@ void SSPass_ApplyGPUResults(int iThread, int facenum) {
     for (int sp = 0; sp < qs.gpuSubPosCount; ++sp) {
       int globalIdx = qs.gpuSubPosOffset + sp;
       const GPULightOutput &out = g_pSSGPUOutput[globalIdx];
+
+      // Find the GPU style slot that matches the style we're supersampling
+      int gpuStyleVal = f->styles[lstyle];
+      int gs = -1;
+      for (int si = 0; si < GPU_MAXLIGHTMAPS; si++) {
+        if (out.styleMap[si] == gpuStyleVal) {
+          gs = si;
+          break;
+        }
+        if (out.styleMap[si] < 0)
+          break; // no more slots
+      }
+
+      if (gs < 0)
+        continue; // this sub-position had no contribution for this style
+
       for (int n = 0; n < sampleInfo.m_NormalCount; ++n) {
-        accum[n].m_vecLighting.x += out.r[n];
-        accum[n].m_vecLighting.y += out.g[n];
-        accum[n].m_vecLighting.z += out.b[n];
+        accum[n].m_vecLighting.x += out.r[gs][n];
+        accum[n].m_vecLighting.y += out.g[gs][n];
+        accum[n].m_vecLighting.z += out.b[gs][n];
       }
     }
 
@@ -4429,4 +4448,17 @@ void ConvertLinearToRGBA8888(const Vector *pSrcLinear, unsigned char *pDst) {
   pDst[1] = RoundFloatToByte(vertexColor[1] * 255.0f);
   pDst[2] = RoundFloatToByte(vertexColor[2] * 255.0f);
   pDst[3] = 255;
+}
+
+//-----------------------------------------------------------------------------
+// Print a single summary line for accumulated "face vectors parallel to face
+// normal" warnings (replaces per-face Warning spam). Resets counter.
+//-----------------------------------------------------------------------------
+void PrintAndResetParallelFaceVectorWarnings() {
+  long count = InterlockedExchange(&g_nParallelFaceVectorWarnings, 0);
+  if (count > 0) {
+    Warning("  %ld face(s) had degenerate face vectors (parallel to normal) — "
+            "bad lighting may be produced on those faces.\n",
+            count);
+  }
 }

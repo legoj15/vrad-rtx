@@ -54,6 +54,8 @@ static GPULight ConvertDirectLight(const directlight_t *dl) {
   gpu.endFadeDistance = dl->m_flEndFadeDistance;
   gpu.capDist = dl->m_flCapDist;
 
+  gpu.style = dl->light.style;
+
   return gpu;
 }
 
@@ -431,6 +433,7 @@ void DownloadAndApplyGPUResults() {
   double totalR = 0, totalG = 0, totalB = 0;
   int zeroSamples = 0, nonzeroSamples = 0;
   float maxR = 0, maxG = 0, maxB = 0;
+  int namedStyleSamples = 0; // track non-zero style applications
 
   for (int facenum = 0; facenum < numfaces; facenum++) {
     facelight_t &fl = facelight[facenum];
@@ -438,10 +441,9 @@ void DownloadAndApplyGPUResults() {
       continue;
     }
 
+    dface_t *f = &g_pFaces[facenum];
     int normalCount =
-        (texinfo[g_pFaces[facenum].texinfo].flags & SURF_BUMPLIGHT)
-            ? NUM_BUMP_VECTS + 1
-            : 1;
+        (texinfo[f->texinfo].flags & SURF_BUMPLIGHT) ? NUM_BUMP_VECTS + 1 : 1;
 
     // Allocate gpu_point[] to store GPU point light contributions separately.
     // These are subtracted before gradient detection and restored after SS.
@@ -465,13 +467,13 @@ void DownloadAndApplyGPUResults() {
 
       const GPULightOutput &out = hostOutput[sampleCursor];
 
-      // Diagnostic tracking (channel [0] = flat normal, point lights only)
-      totalR += out.r[0];
-      totalG += out.g[0];
-      totalB += out.b[0];
-      float totalSampleR = out.r[0];
-      float totalSampleG = out.g[0];
-      float totalSampleB = out.b[0];
+      // Diagnostic tracking (style slot 0, bump channel 0 = flat normal)
+      totalR += out.r[0][0];
+      totalG += out.g[0][0];
+      totalB += out.b[0][0];
+      float totalSampleR = out.r[0][0];
+      float totalSampleG = out.g[0][0];
+      float totalSampleB = out.b[0][0];
       if (totalSampleR > maxR)
         maxR = totalSampleR;
       if (totalSampleG > maxG)
@@ -483,17 +485,56 @@ void DownloadAndApplyGPUResults() {
       else
         nonzeroSamples++;
 
-      // Apply per-bump-vector GPU point light results to lightstyle 0.
-      // Also store in gpu_point[] for subtract/restore.
-      for (int n = 0; n < normalCount; n++) {
-        if (fl.light[0][n]) {
-          fl.light[0][n][s].m_vecLighting.x += out.r[n];
-          fl.light[0][n][s].m_vecLighting.y += out.g[n];
-          fl.light[0][n][s].m_vecLighting.z += out.b[n];
+      // Iterate over GPU style slots and route each into the correct CPU
+      // lightstyle slot via FindOrAllocateLightstyleSamples.
+      for (int gs = 0; gs < GPU_MAXLIGHTMAPS; gs++) {
+        int gpuStyle = out.styleMap[gs];
+        if (gpuStyle < 0)
+          break; // no more styles for this sample
 
-          fl.gpu_point[0][n][s].m_vecLighting.x = out.r[n];
-          fl.gpu_point[0][n][s].m_vecLighting.y = out.g[n];
-          fl.gpu_point[0][n][s].m_vecLighting.z = out.b[n];
+        // Check if this style slot has any energy at all
+        bool hasEnergy = false;
+        for (int n = 0; n < normalCount; n++) {
+          if (out.r[gs][n] > 0.0f || out.g[gs][n] > 0.0f ||
+              out.b[gs][n] > 0.0f) {
+            hasEnergy = true;
+            break;
+          }
+        }
+        if (!hasEnergy)
+          continue;
+
+        // Find or allocate the CPU-side lightstyle slot
+        int cpuSlot =
+            FindOrAllocateLightstyleSamples(f, &fl, gpuStyle, normalCount);
+        if (cpuSlot < 0)
+          continue; // overflow — too many styles on this face
+
+        if (gpuStyle != 0)
+          namedStyleSamples++;
+
+        // Apply per-bump-vector GPU results to this style slot.
+        // Also store in gpu_point[] for subtract/restore during SS.
+        // If FindOrAllocateLightstyleSamples created a new slot,
+        // gpu_point[cpuSlot] won't have been pre-allocated — allocate now.
+        for (int n = 0; n < normalCount; n++) {
+          if (fl.light[cpuSlot][n]) {
+            if (!fl.gpu_point[cpuSlot][n]) {
+              fl.gpu_point[cpuSlot][n] = new LightingValue_t[fl.numsamples];
+              memset(fl.gpu_point[cpuSlot][n], 0,
+                     fl.numsamples * sizeof(LightingValue_t));
+              GPUHostMem_Track("gpu_point", (long long)fl.numsamples *
+                                                sizeof(LightingValue_t));
+            }
+
+            fl.light[cpuSlot][n][s].m_vecLighting.x += out.r[gs][n];
+            fl.light[cpuSlot][n][s].m_vecLighting.y += out.g[gs][n];
+            fl.light[cpuSlot][n][s].m_vecLighting.z += out.b[gs][n];
+
+            fl.gpu_point[cpuSlot][n][s].m_vecLighting.x = out.r[gs][n];
+            fl.gpu_point[cpuSlot][n][s].m_vecLighting.y = out.g[gs][n];
+            fl.gpu_point[cpuSlot][n][s].m_vecLighting.z = out.b[gs][n];
+          }
         }
       }
       applied++;
@@ -504,6 +545,10 @@ void DownloadAndApplyGPUResults() {
 
   Msg("DownloadAndApplyGPUResults: Applied %d sample results across %d faces\n",
       applied, numFaces);
+  if (namedStyleSamples > 0) {
+    Msg("  Named light styles: %d sample-style applications (non-zero style)\n",
+        namedStyleSamples);
+  }
   Msg("  GPU Output Diagnostics:\n");
   Msg("    Total energy: R=%.1f G=%.1f B=%.1f\n", totalR, totalG, totalB);
   Msg("    Nonzero samples: %d (%.1f%%)\n", nonzeroSamples,

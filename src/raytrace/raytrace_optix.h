@@ -122,7 +122,7 @@ private:
   static class CThreadMutex s_Mutex;
 
   // ----- GPU Bounce buffers -----
-  static int *s_d_csrOffsets;
+  static long long *s_d_csrOffsets;
   static int *s_d_csrPatch;
   static float *s_d_csrWeight;
   static float3_t *s_d_reflectivity;
@@ -153,8 +153,8 @@ private:
 public:
   // GPU Bounce light gathering
   static bool InitBounceBuffers(int numPatches, int totalTransfers,
-                                const int *csrOffsets, const int *csrPatch,
-                                const float *csrWeight,
+                                const long long *csrOffsets,
+                                const int *csrPatch, const float *csrWeight,
                                 const float *reflectivity,
                                 const float *patchOrigin,
                                 const float *patchNormal,

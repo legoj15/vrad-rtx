@@ -110,7 +110,7 @@ void *RayTraceOptiX::s_directLightingRaygenPG = nullptr;
 CThreadMutex RayTraceOptiX::s_Mutex;
 
 // Bounce GPU buffers
-int *RayTraceOptiX::s_d_csrOffsets = nullptr;
+long long *RayTraceOptiX::s_d_csrOffsets = nullptr;
 int *RayTraceOptiX::s_d_csrPatch = nullptr;
 float *RayTraceOptiX::s_d_csrWeight = nullptr;
 float3_t *RayTraceOptiX::s_d_reflectivity = nullptr;
@@ -305,7 +305,8 @@ bool RayTraceOptiX::Initialize() {
   pipelineOptions.usesMotionBlur = false;
   pipelineOptions.traversableGraphFlags =
       OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-  pipelineOptions.numPayloadValues = 6; // hit_t, hit_id, normal.xyz, skip_id
+  pipelineOptions.numPayloadValues =
+      7; // hit_t, hit_id, normal.xyz, skip_id, transparency
   pipelineOptions.numAttributeValues = 2;
   pipelineOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
   pipelineOptions.pipelineLaunchParamsVariableName = "params";
@@ -1106,7 +1107,7 @@ extern "C" void LaunchGatherLightBumpKernel(const BounceGatherParams &params,
 // Called once after BuildVisMatrix completes
 // -----------------------------------------------------------------------------
 bool RayTraceOptiX::InitBounceBuffers(
-    int numPatches, int totalTransfers, const int *csrOffsets,
+    int numPatches, int totalTransfers, const long long *csrOffsets,
     const int *csrPatch, const float *csrWeight, const float *reflectivity,
     const float *patchOrigin, const float *patchNormal, const int *needsBumpmap,
     const int *faceNumber, const float *bumpNormals, int numBumpPatches) {
@@ -1125,9 +1126,9 @@ bool RayTraceOptiX::InitBounceBuffers(
           (1024.0f * 1024.0f));
 
   // CSR transfer data
-  CUDA_CHECK(cudaMalloc(&s_d_csrOffsets, (numPatches + 1) * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&s_d_csrOffsets, (numPatches + 1) * sizeof(long long)));
   CUDA_CHECK(cudaMemcpy(s_d_csrOffsets, csrOffsets,
-                        (numPatches + 1) * sizeof(int),
+                        (numPatches + 1) * sizeof(long long),
                         cudaMemcpyHostToDevice));
 
   CUDA_CHECK(cudaMalloc(&s_d_csrPatch, totalTransfers * sizeof(int)));

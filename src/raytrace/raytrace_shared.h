@@ -94,8 +94,9 @@ struct CUDATraceParams {
 // Parameters for bounce GatherLight CUDA kernel (CSR format)
 struct BounceGatherParams {
   // CSR transfer lists
-  const int *csrOffsets;  // [numPatches+1] - start of each patch's transfers
-  const int *csrPatch;    // [totalTransfers] - source patch index
+  const long long *csrOffsets; // [numPatches+1] - start of each patch's
+                               // transfers (long long to support >2B transfers)
+  const int *csrPatch;         // [totalTransfers] - source patch index
   const float *csrWeight; // [totalTransfers] - transfer weight (normalized)
 
   // Per-patch data (read-only during bounces)
@@ -116,6 +117,10 @@ struct BounceGatherParams {
       addlightBump; // [numPatches * 3] - bump light for 3 bump vecs (if needed)
 
   int numPatches;
+  int patchOffset; // Global offset: kernel thread j maps to global patch
+                   // (j + patchOffset). Used for chunked streaming where
+                   // patchOrigin/patchNormal are global arrays but the kernel
+                   // processes a subset of patches.
 };
 
 #endif // RAYTRACE_SHARED_H

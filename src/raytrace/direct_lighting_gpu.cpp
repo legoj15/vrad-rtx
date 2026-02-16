@@ -225,10 +225,20 @@ void AllocateDirectLightingOutput(int numSamples) {
     return;
   }
 
-  // Zero the buffer so atomicAdd starts from 0
-  err = cudaMemset(s_deviceLightOutput, 0, bytes);
+  // Initialize: zero all r/g/b accumulators, set styleMap to -1 (unused).
+  // cudaMemset(0) alone won't work since -1 != 0 for styleMap entries.
+  GPULightOutput *hostInit = new GPULightOutput[numSamples];
+  memset(hostInit, 0, bytes);
+  for (int i = 0; i < numSamples; i++) {
+    for (int s = 0; s < GPU_MAXLIGHTMAPS; s++) {
+      hostInit[i].styleMap[s] = -1;
+    }
+  }
+  err =
+      cudaMemcpy(s_deviceLightOutput, hostInit, bytes, cudaMemcpyHostToDevice);
+  delete[] hostInit;
   if (err != cudaSuccess) {
-    printf("AllocateDirectLightingOutput: cudaMemset failed: %s\n",
+    printf("AllocateDirectLightingOutput: cudaMemcpy init failed: %s\n",
            cudaGetErrorString(err));
   }
 

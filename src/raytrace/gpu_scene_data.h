@@ -42,12 +42,16 @@ struct GPUFaceInfo {
 };
 
 // Per-sample direct lighting output from the GPU kernel.
-// 4 channels: [0]=flat normal, [1..3]=bump basis normals.
-// Non-bumpmapped faces only use channel [0].
+// First dimension [4] = lightstyle slots (matching MAXLIGHTMAPS).
+// Second dimension [4] = bump vectors: [0]=flat normal, [1..3]=bump basis.
+// Non-bumpmapped faces only use bump channel [0].
+// styleMap[s] holds the lightstyle value for slot s (-1 = unused).
+#define GPU_MAXLIGHTMAPS 4
 struct GPULightOutput {
-  float r[4], g[4],
-      b[4]; // Per-bump-vector accumulated light (all types:
-            // point/surface/spot/sky/ambient)
+  float r[GPU_MAXLIGHTMAPS][4], g[GPU_MAXLIGHTMAPS][4],
+      b[GPU_MAXLIGHTMAPS][4];     // [style_slot][bump_vector]
+  int styleMap[GPU_MAXLIGHTMAPS]; // lightstyle value for each slot (-1 =
+                                  // unused)
 };
 
 //-----------------------------------------------------------------------------

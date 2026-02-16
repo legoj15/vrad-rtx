@@ -279,16 +279,20 @@ __global__ void GatherLightKernel(BounceGatherParams params) {
   if (j >= params.numPatches)
     return;
 
+  // Global patch index for per-patch array lookups
+  int gj = j + params.patchOffset;
+
   // Skip bump-mapped patches (handled by bump kernel)
-  if (params.needsBumpmap[j])
+  if (params.needsBumpmap[gj])
     return;
 
-  int start = params.csrOffsets[j];
-  int end = params.csrOffsets[j + 1];
+  // CSR is chunk-local: indexed by j
+  long long start = params.csrOffsets[j];
+  long long end = params.csrOffsets[j + 1];
 
   float sx = 0.0f, sy = 0.0f, sz = 0.0f;
 
-  for (int k = start; k < end; k++) {
+  for (long long k = start; k < end; k++) {
     int srcPatch = params.csrPatch[k];
     float weight = params.csrWeight[k];
 
@@ -305,7 +309,7 @@ __global__ void GatherLightKernel(BounceGatherParams params) {
   result.x = sx;
   result.y = sy;
   result.z = sz;
-  params.addlight[j] = result;
+  params.addlight[gj] = result;
 }
 
 // Bump-mapped patches: needs delta direction and dot products against normals
@@ -317,26 +321,31 @@ __global__ void GatherLightKernel(BounceGatherParams params) {
 // dot and multiplying by each bump normal dot.
 __global__ void
 GatherLightBumpKernel(BounceGatherParams params,
-                      const float3_t *patchBumpNormals // [numPatches * 4]
+                      const float3_t *patchBumpNormals // [totalPatches * 4]
 ) {
   int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (j >= params.numPatches)
     return;
 
+  // Global patch index for per-patch array lookups
+  int gj = j + params.patchOffset;
+
   // Only process bump-mapped patches
-  if (!params.needsBumpmap[j])
+  if (!params.needsBumpmap[gj])
     return;
 
-  int start = params.csrOffsets[j];
-  int end = params.csrOffsets[j + 1];
+  // CSR is chunk-local: indexed by j
+  long long start = params.csrOffsets[j];
+  long long end = params.csrOffsets[j + 1];
 
-  float3_t patchOrig = params.patchOrigin[j];
-  float3_t patchNrm = params.patchNormal[j];
+  // Self patch data: use global index gj
+  float3_t patchOrig = params.patchOrigin[gj];
+  float3_t patchNrm = params.patchNormal[gj];
 
-  // Load the 4 normals for this patch (flat + 3 bump)
+  // Load the 4 normals for this patch: use global index gj
   float3_t normals[4];
   for (int n = 0; n < 4; n++) {
-    normals[n] = patchBumpNormals[j * 4 + n];
+    normals[n] = patchBumpNormals[gj * 4 + n];
   }
 
   // Accumulators for 4 bump directions
@@ -344,10 +353,11 @@ GatherLightBumpKernel(BounceGatherParams params,
   float bsy[4] = {0, 0, 0, 0};
   float bsz[4] = {0, 0, 0, 0};
 
-  for (int k = start; k < end; k++) {
+  for (long long k = start; k < end; k++) {
     int srcPatch = params.csrPatch[k];
     float weight = params.csrWeight[k];
 
+    // Source patch data: srcPatch is already a global index
     float3_t srcOrig = params.patchOrigin[srcPatch];
     float3_t emit = params.emitlight[srcPatch];
     float3_t refl = params.reflectivity[srcPatch];
@@ -388,12 +398,12 @@ GatherLightBumpKernel(BounceGatherParams params,
     }
   }
 
-  // Write flat normal result
+  // Write results using global index gj
   float3_t r0;
   r0.x = bsx[0];
   r0.y = bsy[0];
   r0.z = bsz[0];
-  params.addlight[j] = r0;
+  params.addlight[gj] = r0;
 
   // Write 3 bump results
   for (int n = 0; n < 3; n++) {
@@ -401,7 +411,7 @@ GatherLightBumpKernel(BounceGatherParams params,
     r.x = bsx[n + 1];
     r.y = bsy[n + 1];
     r.z = bsz[n + 1];
-    params.addlightBump[j * 3 + n] = r;
+    params.addlightBump[gj * 3 + n] = r;
   }
 }
 

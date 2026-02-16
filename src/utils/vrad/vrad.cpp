@@ -1652,7 +1652,8 @@ static void BuildBounceCSR_GPU(void) {
   }
 
   // Build CSR arrays (use size_t for allocation to handle large counts)
-  int *csrOffsets = (int *)malloc((size_t)(numPatches + 1) * sizeof(int));
+  long long *csrOffsets =
+      (long long *)malloc((size_t)(numPatches + 1) * sizeof(long long));
   int *csrPatch = (int *)malloc((size_t)totalTrans * sizeof(int));
   float *csrWeight = (float *)malloc((size_t)totalTrans * sizeof(float));
 
@@ -1665,9 +1666,9 @@ static void BuildBounceCSR_GPU(void) {
 
   // Track all CSR host allocations
   long long csrHostBytes =
-      (long long)(numPatches + 1) * sizeof(int) + // csrOffsets
-      (long long)totalTrans * sizeof(int) +       // csrPatch
-      (long long)totalTrans * sizeof(float) +     // csrWeight
+      (long long)(numPatches + 1) * sizeof(long long) + // csrOffsets
+      (long long)totalTrans * sizeof(int) +             // csrPatch
+      (long long)totalTrans * sizeof(float) +           // csrWeight
       (long long)numPatches * 3 * sizeof(float) *
           3 +                                  // reflectivity+origin+normal
       (long long)numPatches * sizeof(int) * 2; // needsBumpmap+faceNumber
@@ -1679,7 +1680,7 @@ static void BuildBounceCSR_GPU(void) {
   long long offset = 0;
   for (unsigned int i = 0; i < numPatches; i++) {
     CPatch *patch = &g_Patches[i];
-    csrOffsets[i] = (int)offset;
+    csrOffsets[i] = (long long)offset;
 
     // Copy transfer list into CSR
     for (int k = 0; k < patch->numtransfers; k++) {
@@ -1706,7 +1707,7 @@ static void BuildBounceCSR_GPU(void) {
     if (patch->needsBumpmap)
       numBumpPatches++;
   }
-  csrOffsets[numPatches] = (int)offset;
+  csrOffsets[numPatches] = (long long)offset;
 
   // Precompute bump normals (4 normals per patch: flat + 3 bump)
   float *bumpNormals = nullptr;

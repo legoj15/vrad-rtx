@@ -40,6 +40,9 @@ struct GPULight {
   float startFadeDistance;
   float endFadeDistance;
   float capDist;
+
+  // Lightstyle index (0 = always-on, 1-63 = named/switchable)
+  int style;
 };
 
 // Light type enums (must match emittype_t in bspfile.h)
@@ -136,6 +139,8 @@ extern "C" __global__ void __raygen__visibility() {
   unsigned int p3 = __float_as_uint(0.0f);     // normal.y
   unsigned int p4 = __float_as_uint(0.0f);     // normal.z
   unsigned int p5 = (unsigned int)ray.skip_id; // skip_id for filtering
+  unsigned int p6 =
+      __float_as_uint(0.0f); // coverage accumulator (0.0 = no occlusion)
 
   // Use small epsilon for tmin to avoid self-intersection at ray origin
   // 1e-4 is optimal for Source engine units - smaller values cause self-hits
@@ -152,7 +157,7 @@ extern "C" __global__ void __raygen__visibility() {
              0, // SBT offset
              1, // SBT stride
              0, // missSBTIndex
-             p0, p1, p2, p3, p4, p5);
+             p0, p1, p2, p3, p4, p5, p6);
 
   // Write results
   RayResult &result = params.results[rayIdx];
@@ -183,7 +188,7 @@ extern "C" __global__ void __anyhit__visibility() {
     return;
   }
 
-  // Texture shadow check: if enabled and triangle is transparent
+  // Texture shadow check: if enabled and triangle has transparency flag
   if (params.textureShadowsEnabled && (tri.flags & 0x01)) {
     int matIdx = params.d_triMaterials[primIdx];
     if (matIdx >= 0) {
@@ -207,8 +212,15 @@ extern "C" __global__ void __anyhit__visibility() {
       unsigned char alpha =
           params.d_alphaAtlas[mat.atlasOffset + iv * mat.texWidth + iu];
 
-      // Phase 1: Binary alpha test - alpha == 0 means fully transparent
-      if (alpha == 0) {
+      // True transparency: additive coverage model (matches CPU)
+      // CPU does: coverage += alpha/255; coverage = min(coverage, 1.0);
+      float addedCoverage = alpha * (1.0f / 255.0f);
+      float coverage = __uint_as_float(optixGetPayload_6());
+      coverage = fminf(coverage + addedCoverage, 1.0f);
+      optixSetPayload_6(__float_as_uint(coverage));
+
+      // If coverage hasn't reached 1.0, let the ray continue
+      if (coverage < 1.0f) {
         optixIgnoreIntersection();
         return;
       }
@@ -333,9 +345,10 @@ extern "C" __global__ void __raygen__cluster_visibility() {
       float3 dirNorm = make_float3(dir.x / len, dir.y / len, dir.z / len);
 
       // Trace Visibility Ray
-      unsigned int p0, p1, p2, p3, p4, p5;
-      p5 = (unsigned int)-1; // Skip ID - don't self collide, but we offset
-                             // origin anyway
+      unsigned int p0, p1, p2, p3, p4, p5, p6;
+      p5 = (unsigned int)-1;      // Skip ID - don't self collide, but we offset
+                                  // origin anyway
+      p6 = __float_as_uint(0.0f); // Coverage accumulator
 
       // optixTrace — use OPTIX_RAY_FLAG_NONE so any-hit runs for
       // both skip_id filtering and texture shadow transparency
@@ -345,7 +358,7 @@ extern "C" __global__ void __raygen__cluster_visibility() {
           len - 1e-4f, // tmax (fixed epsilon subtraction instead of scaling)
           0.0f, OptixVisibilityMask(255),
           OPTIX_RAY_FLAG_NONE, // Enable any-hit for texture shadows
-          0, 1, 0, p0, p1, p2, p3, p4, p5); // Payload
+          0, 1, 0, p0, p1, p2, p3, p4, p5, p6); // Payload
 
       // Check result
       // Our __miss__ sets hit_id to -1. __closesthit__ sets it to primIdx.
@@ -394,12 +407,13 @@ extern "C" __global__ void __raygen__cluster_visibility() {
 //-----------------------------------------------------------------------------
 __forceinline__ __device__ float TraceShadowRay(float3 origin, float3 direction,
                                                 float tmax) {
-  // Shadow ray: we only need boolean hit/miss
-  // Use OPTIX_RAY_FLAG_NONE to allow any-hit to filter skip_id
+  // Shadow ray with true transparency support
+  // Use OPTIX_RAY_FLAG_NONE to allow any-hit for skip_id and alpha accumulation
   unsigned int p0 = __float_as_uint(1e30f);
   unsigned int p1 = (unsigned int)-1;
   unsigned int p2 = 0, p3 = 0, p4 = 0;
-  unsigned int p5 = (unsigned int)-1; // No skip ID for shadow rays
+  unsigned int p5 = (unsigned int)-1;      // No skip ID for shadow rays
+  unsigned int p6 = __float_as_uint(0.0f); // Coverage accumulator
 
   optixTrace(params.traversable, origin, direction,
              1e-3f, // tmin: avoid self-shadow artifacts
@@ -407,18 +421,28 @@ __forceinline__ __device__ float TraceShadowRay(float3 origin, float3 direction,
              0.0f,  // rayTime
              OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1,
              0, // SBT offset, stride, miss index
-             p0, p1, p2, p3, p4, p5);
+             p0, p1, p2, p3, p4, p5, p6);
 
-  // Miss (hit_id == -1) means visible
-  return ((int)p1 == -1) ? 1.0f : 0.0f;
+  // Return visibility from additive coverage model (matches CPU)
+  float coverage = __uint_as_float(p6);
+  int hitPrim = (int)p1;
+
+  // Miss = ray reached end without hitting anything solid
+  // Return fractional visibility: 1.0 - accumulated coverage
+  if (hitPrim == -1)
+    return 1.0f - coverage;
+
+  // Closest hit was accepted (opaque surface, or coverage reached 1.0)
+  // Either way, the path to the light is fully blocked.
+  return 0.0f;
 }
 
 //-----------------------------------------------------------------------------
-// Inline sky visibility trace: returns 1.0 if sky is visible, 0.0 if blocked
-// "Does hit sky" semantics: trace toward sky direction.
-//   - Miss = ray escapes to sky → visible (1.0)
-//   - Hit sky triangle (TRACE_ID_SKY) → visible (1.0)
-//   - Hit solid geometry → blocked (0.0)
+// Inline sky visibility trace: returns fractional visibility [0.0–1.0]
+// "Does hit sky" semantics with true transparency support.
+//   - Miss = ray escapes to sky → visible (transparency from any-hit)
+//   - Hit sky triangle (TRACE_ID_SKY) → visible (transparency from any-hit)
+//   - Hit solid geometry → blocked (0.0, transparency already 0 from any-hit)
 //-----------------------------------------------------------------------------
 __forceinline__ __device__ float TraceSkyRay(float3 origin, float3 direction,
                                              float tmax) {
@@ -426,6 +450,7 @@ __forceinline__ __device__ float TraceSkyRay(float3 origin, float3 direction,
   unsigned int p1 = (unsigned int)-1;
   unsigned int p2 = 0, p3 = 0, p4 = 0;
   unsigned int p5 = (unsigned int)-1;
+  unsigned int p6 = __float_as_uint(0.0f); // Coverage accumulator
 
   optixTrace(params.traversable, origin, direction,
              1e-3f, // tmin
@@ -433,19 +458,20 @@ __forceinline__ __device__ float TraceSkyRay(float3 origin, float3 direction,
              0.0f,  // rayTime
              OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1,
              0, // SBT offset, stride, miss index
-             p0, p1, p2, p3, p4, p5);
+             p0, p1, p2, p3, p4, p5, p6);
 
+  float coverage = __uint_as_float(p6);
   int hitPrim = (int)p1;
 
-  // Miss → sky visible
+  // Miss → sky visible, return fractional visibility
   if (hitPrim == -1)
-    return 1.0f;
+    return 1.0f - coverage;
 
-  // Check if closest hit is a sky triangle
+  // Hit sky triangle → sky visible through any transparent surfaces
   if (params.triangles[hitPrim].triangle_id & TRACE_ID_SKY_GPU)
-    return 1.0f;
+    return 1.0f - coverage;
 
-  // Hit solid geometry → blocked
+  // Hit solid (non-sky) geometry → fully blocked
   return 0.0f;
 }
 
@@ -493,11 +519,15 @@ extern "C" __global__ void __raygen__direct_lighting() {
   int lightOffset = clusterList.lightOffset;
   int lightCount = clusterList.lightCount;
 
-  // Accumulators for this sample — one per bump vector
-  // Point/surface/spot lights go here.
-  float accumR[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  float accumG[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  float accumB[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  // Per-style accumulators: [style_slot][bump_vector]
+  // Matches CPU's MAXLIGHTMAPS (4) style slots per face.
+  float accumR[4][4] = {};
+  float accumG[4][4] = {};
+  float accumB[4][4] = {};
+
+  // Style→slot mapping: styleSlots[s] = lightstyle value for slot s
+  int styleSlots[4] = {-1, -1, -1, -1};
+  int numStyles = 0;
 
   // Separate sun/sky accumulators removed — CPU evaluates sky now.
   // Only point/surface/spot lights are accumulated on GPU.
@@ -509,6 +539,23 @@ extern "C" __global__ void __raygen__direct_lighting() {
       continue;
 
     const GPULight &light = params.d_lights[lightIdx];
+
+    // Resolve this light's style to a slot index (0–3)
+    int slot = -1;
+    for (int s = 0; s < numStyles; s++) {
+      if (styleSlots[s] == light.style) {
+        slot = s;
+        break;
+      }
+    }
+    if (slot < 0) {
+      if (numStyles < 4) {
+        slot = numStyles++;
+        styleSlots[slot] = light.style;
+      } else {
+        continue; // overflow — matches CPU's FindOrAllocateLightstyleSamples
+      }
+    }
 
     // ---------------------------------------------------------------
     // Sky light types — directional lights with no position.
@@ -569,18 +616,18 @@ extern "C" __global__ void __raygen__direct_lighting() {
 
       // Accumulate: seeAmount * dot * intensity (matches CPU AddLight path)
       float scale0 = seeAmount * dot;
-      accumR[0] += scale0 * light.intensity_x;
-      accumG[0] += scale0 * light.intensity_y;
-      accumB[0] += scale0 * light.intensity_z;
+      accumR[slot][0] += scale0 * light.intensity_x;
+      accumG[slot][0] += scale0 * light.intensity_y;
+      accumB[slot][0] += scale0 * light.intensity_z;
 
       for (int n = 1; n < normalCount; n++) {
         float bDot = bumpNormals[n].x * sunDir.x + bumpNormals[n].y * sunDir.y +
                      bumpNormals[n].z * sunDir.z;
         bDot = fmaxf(bDot, 0.0f);
         float bScale = seeAmount * bDot;
-        accumR[n] += bScale * light.intensity_x;
-        accumG[n] += bScale * light.intensity_y;
-        accumB[n] += bScale * light.intensity_z;
+        accumR[slot][n] += bScale * light.intensity_x;
+        accumG[slot][n] += bScale * light.intensity_y;
+        accumB[slot][n] += bScale * light.intensity_z;
       }
       continue;
     }
@@ -639,16 +686,16 @@ extern "C" __global__ void __raygen__direct_lighting() {
         ambientAccumB[0] += w0 * light.intensity_z;
 
         // Bump normals
-        for (int n = 1; n < normalCount; n++) {
-          float bDot = bumpNormals[n].x * traceDir.x +
-                       bumpNormals[n].y * traceDir.y +
-                       bumpNormals[n].z * traceDir.z;
+        for (int bn = 1; bn < normalCount; bn++) {
+          float bDot = bumpNormals[bn].x * traceDir.x +
+                       bumpNormals[bn].y * traceDir.y +
+                       bumpNormals[bn].z * traceDir.z;
           if (bDot <= 1e-6f)
             continue;
           float w = vis * bDot;
-          ambientAccumR[n] += w * light.intensity_x;
-          ambientAccumG[n] += w * light.intensity_y;
-          ambientAccumB[n] += w * light.intensity_z;
+          ambientAccumR[bn] += w * light.intensity_x;
+          ambientAccumG[bn] += w * light.intensity_y;
+          ambientAccumB[bn] += w * light.intensity_z;
         }
       }
 
@@ -661,9 +708,9 @@ extern "C" __global__ void __raygen__direct_lighting() {
       //   possibleHitCount[n])
       if (totalDot0 > 0.0f) {
         float invSumDot = 1.0f / totalDot0;
-        accumR[0] += ambientAccumR[0] * invSumDot;
-        accumG[0] += ambientAccumG[0] * invSumDot;
-        accumB[0] += ambientAccumB[0] * invSumDot;
+        accumR[slot][0] += ambientAccumR[0] * invSumDot;
+        accumG[slot][0] += ambientAccumG[0] * invSumDot;
+        accumB[slot][0] += ambientAccumB[0] * invSumDot;
 
         for (int n = 1; n < normalCount; n++) {
           // Scale by possibleHitCount[0]/possibleHitCount[n] to compensate
@@ -672,9 +719,9 @@ extern "C" __global__ void __raygen__direct_lighting() {
                                  ? possibleHitCount[0] / possibleHitCount[n]
                                  : 1.0f;
           float factor = invSumDot * bumpFactor;
-          accumR[n] += ambientAccumR[n] * factor;
-          accumG[n] += ambientAccumG[n] * factor;
-          accumB[n] += ambientAccumB[n] * factor;
+          accumR[slot][n] += ambientAccumR[n] * factor;
+          accumG[slot][n] += ambientAccumG[n] * factor;
+          accumB[slot][n] += ambientAccumB[n] * factor;
         }
       }
       continue;
@@ -854,9 +901,9 @@ extern "C" __global__ void __raygen__direct_lighting() {
     // dot[0] is the flat normal (already computed); dot[1..3] are bump basis
     // ---------------------------------------------------------------
     float scale0 = falloff * dot * visibility;
-    accumR[0] += scale0 * light.intensity_x;
-    accumG[0] += scale0 * light.intensity_y;
-    accumB[0] += scale0 * light.intensity_z;
+    accumR[slot][0] += scale0 * light.intensity_x;
+    accumG[slot][0] += scale0 * light.intensity_y;
+    accumB[slot][0] += scale0 * light.intensity_z;
 
     // Compute per-bump-vector contributions (only for bumpmapped faces)
     for (int n = 1; n < normalCount; n++) {
@@ -864,22 +911,23 @@ extern "C" __global__ void __raygen__direct_lighting() {
                    bumpNormals[n].z * delta.z;
       bDot = fmaxf(bDot, 0.0f);
       float bScale = falloff * bDot * visibility;
-      accumR[n] += bScale * light.intensity_x;
-      accumG[n] += bScale * light.intensity_y;
-      accumB[n] += bScale * light.intensity_z;
+      accumR[slot][n] += bScale * light.intensity_x;
+      accumG[slot][n] += bScale * light.intensity_y;
+      accumB[slot][n] += bScale * light.intensity_z;
     }
 
   } // for each light
 
   // ---------------------------------------------------------------
-  // Write results via atomicAdd
+  // Write results — no atomics needed (1D launch, one thread per sample)
   // ---------------------------------------------------------------
-  for (int n = 0; n < normalCount; n++) {
-    if (accumR[n] > 0.0f || accumG[n] > 0.0f || accumB[n] > 0.0f) {
-      atomicAdd(&params.d_lightOutput[sampleIdx].r[n], accumR[n]);
-      atomicAdd(&params.d_lightOutput[sampleIdx].g[n], accumG[n]);
-      atomicAdd(&params.d_lightOutput[sampleIdx].b[n], accumB[n]);
+  for (int s = 0; s < numStyles; s++) {
+    params.d_lightOutput[sampleIdx].styleMap[s] = styleSlots[s];
+
+    for (int n = 0; n < normalCount; n++) {
+      params.d_lightOutput[sampleIdx].r[s][n] = accumR[s][n];
+      params.d_lightOutput[sampleIdx].g[s][n] = accumG[s][n];
+      params.d_lightOutput[sampleIdx].b[s][n] = accumB[s][n];
     }
-    // All light types (point/surface/spot/sky/ambient) are accumulated above.
   }
 }

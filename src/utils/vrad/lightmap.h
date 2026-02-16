@@ -152,6 +152,10 @@ extern void InitLightinfo(lightinfo_t *l, int facenum);
 
 void FreeDLights();
 
+// Print and reset the accumulated "face vectors parallel to normal" warning
+// count
+void PrintAndResetParallelFaceVectorWarnings();
+
 void ExportDirectLightsToWorldLights();
 
 // Direct Lighting diagnostic counters (defined in lightmap.cpp)
@@ -245,5 +249,11 @@ void SSPass_ApplyGPUResults(int iThread, int facenum);
 void SSPass_BuildPatchLights(int iThread, int facenum);
 
 #endif
+
+// Find or allocate a lightstyle slot on a face (defined in lightmap.cpp).
+// Returns slot index [0..MAXLIGHTMAPS-1], or -1 on overflow.
+struct dface_t;
+int FindOrAllocateLightstyleSamples(dface_t *f, facelight_t *fl, int lightstyle,
+                                    int numnormals);
 
 #endif // LIGHTMAP_H
